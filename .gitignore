@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.ipynb_checkpoints/
+
+# Virtual Environments
+.venv/
+venv/
+ENV/
+
+# Project Specific
+Images/
+results/
+
+# IDEs
+.vscode/
+.idea/
+
+# Claude Code
+.claude/
+
+# Pytest cache
+.pytest_cache/
