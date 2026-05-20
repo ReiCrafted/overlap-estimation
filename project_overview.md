@@ -59,6 +59,7 @@ The overlap detection system is built around a multi-stage sequential pipeline m
    - Inputs: Keypoint lists and matches.
    - Outputs: Inliers mask and estimated affine transformation matrix (`verify_affine`) using robust estimators like `PROSAC` or `USAC_MAGSAC`.
    - After RANSAC, `orchestrator.py` applies an **affine sanity filter** before accepting the result: the estimated matrix is decomposed into scale (column-0 norm of the 2×2 sub-matrix) and rotation (`atan2(a10, a00)`). If `|scale − 1| > 10%` or `|rotation| > 3°` the result is rejected with a descriptive error message and the pair is counted as failed. This catches geometrically implausible transforms that accumulate enough inliers to pass RANSAC but are physically impossible for near-planar, similarly-scaled adjacent image pairs. Thresholds are defined as `_MAX_SCALE_DIFF = 0.10` and `_MAX_ROTATION_DEG = 3.0` in `orchestrator.py`.
+   - After the metrics stage, two additional **post-verification quality gates** are applied when ground truth is available (see Stage 8).
 
 6. **Stage 6: Overlap Geometry** (`geometry.py`)
    - Inputs: Estimated transformation matrix and image shapes.
@@ -70,9 +71,20 @@ The overlap detection system is built around a multi-stage sequential pipeline m
 
 8. **Orchestration** (`orchestrator.py`)
    - Manages matrix runs, pipeline execution loops, error fallbacks, and multi-configuration sweeps.
+   - **Quality gates and `quality_flag`.** After metrics are computed, `_apply_quality_gates` demotes `result.success` to `False` if any of these GT-dependent thresholds are violated:
+     - `iou < RunConfig.iou_threshold` (default `0.90`)
+     - `rms_corner_error > RunConfig.rms_error_threshold_px` (default `10.0` px)
+     Combined with the affine sanity check and the `fallback_min_inliers` gate, this gives a strict pass/fail outcome per run. The result is stamped with a `quality_flag` string:
+     - `"true"`               — passed all gates on the primary attempt.
+     - `"false"`              — failed (non-fallback configuration).
+     - `"true after false"`   — fallback path was taken; the mask-mode attempt passed after the no-mask attempt failed.
+     - `"false after false"`  — both fallback attempts failed.
+     GT-dependent gates (IoU, RMS) are skipped when no ground truth is supplied for the pair, in which case only the affine sanity / inlier-count gates determine `success`.
+   - **Multi-core execution.** `run_experiment_matrix` accepts `n_workers` and fans pairs out across a process pool. Each worker reads one image pair once and runs every pending configuration for it, writing per-`(pair, config)` JSON files as it goes. The pool uses the `spawn` start method (Windows-friendly; avoids inheriting OpenCV/GUI state). Defaults are picked by `default_experiment_workers()` — `cpu_count - 1`, capped at `_DEFAULT_EXPERIMENT_WORKER_CAP = 8`. Pass `--workers 1` to force serial execution for debugging.
 
 9. **Ground Truth Annotation** (`annotation_gui.py`)
    - Provides a standalone Tkinter GUI allowing manual alignment and corner-picking to establish ground-truth homographies.
+   - Background auto-alignment runs in a `multiprocessing.Pool` while the user reviews. Worker count defaults via `auto_aligner.default_auto_align_workers()` — `cpu_count - 1`, capped at `_DEFAULT_AUTO_ALIGN_WORKER_CAP = 6`.
 
 ---
 
@@ -163,11 +175,47 @@ class RunConfig:
     # Fallback logic
     fallback_min_inliers: int = 8
 
+    # Quality gates (applied after metrics, when GT is available)
+    iou_threshold: float = 0.90               # mAA / quality_flag pass requires iou ≥ this
+    rms_error_threshold_px: float = 10.0      # mAA / quality_flag pass requires rms ≤ this
+
     # Output
     output_dir: Path = Path("./results")
     save_intermediate: bool = False
     random_seed: int = 42
 ```
+
+`VALID_MASK_MODES` (`{"no_mask", "mask", "fallback"}`) and `VALID_ESTIMATORS` (`{"PROSAC", "USAC_MAGSAC"}`) live alongside `DETECTOR_NAMES` / `DESCRIPTOR_NAMES` in `config.py`. CLI entrypoints validate against these sets so unknown strings fail upfront.
+
+---
+
+## Reporting and Metrics
+
+The reporting stage reads `aggregate_results.csv` and emits both visualisations and a markdown summary into the output directory.
+
+### mAA — mean Average Accuracy
+
+A run is considered a **pass** when its `quality_flag` is `"true"` or `"true after false"` (i.e. all of: affine sanity, inlier count, IoU ≥ threshold, corner RMS ≤ threshold). **mAA** is the per-configuration mean of this pass indicator across pairs — a single scalar in `[0, 1]` summarising end-to-end accuracy with both the geometric and accuracy-gate criteria baked in. Older CSVs that predate the `quality_flag` column fall back to `estimation_succeeded` so historical reports remain readable.
+
+### IoU
+
+The per-pair IoU between the predicted and ground-truth overlap polygons (in image-A coordinates) is computed in `metrics.overlap_iou`. Reports include median IoU per configuration and a box-plot per detector+descriptor.
+
+### Per-configuration scoreboard
+
+`write_summary_report` emits a combined table sorted by mAA (desc) then median RMS (asc), with columns: `mAA | Median IoU | Median RMS (px)`. Configurations whose `quality_flag` distribution skews towards `"true after false"` are still counted as passing — the fallback path is a legitimate success route.
+
+### Plots written
+
+* `maa_barplot.png`           — mAA by configuration
+* `success_rate_heatmap.png`  — mAA heatmap, detector × descriptor
+* `iou_boxplot.png`           — IoU by detector+descriptor
+* `rms_error_boxplot.png`     — RMS corner error by detector+descriptor
+* `inlier_vs_rms_scatter.png` — inlier ratio vs RMS (per pair)
+* `inlier_ratio_barplot.png`  — mean inlier ratio by configuration
+* `runtime_boxplot.png`       — total runtime by configuration
+
+All markdown / JSON I/O is UTF-8.
 
 ---
 
