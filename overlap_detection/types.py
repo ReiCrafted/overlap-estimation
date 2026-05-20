@@ -254,5 +254,18 @@ class PairResult:
     success: bool = False
     error_message: Optional[str] = None
 
+    quality_flag: str = "false"
+    """Post-gate outcome of the run.  One of:
+
+    * ``"true"``               — passed all quality gates on the primary attempt.
+    * ``"false"``              — failed (non-fallback config).
+    * ``"true after false"``   — fallback path was taken; mask-mode attempt
+                                 passed after no-mask attempt failed.
+    * ``"false after false"``  — both fallback attempts failed.
+
+    Gates: affine sanity (scale/rotation), inlier count, IoU ≥ threshold,
+    corner RMS error ≤ threshold.  GT-dependent gates are skipped if no
+    ground truth was supplied for the pair."""
+
     # --- Extensible metadata ---------------------------------------------
     extra: dict = field(default_factory=dict)

@@ -7,15 +7,8 @@ from pathlib import Path
 import math
 
 from overlap_detection.auto_aligner import AutoAligner
+from overlap_detection.geometry import invert_affine
 from overlap_detection.orchestrator import list_image_pairs
-
-def invert_affine(M: np.ndarray) -> np.ndarray:
-    """Invert a 2x3 affine matrix."""
-    R = M[:, :2]
-    t = M[:, 2]
-    inv_R = np.linalg.inv(R)
-    inv_t = -inv_R @ t
-    return np.hstack([inv_R, inv_t.reshape(2, 1)])
 
 def compose_affine(M1: np.ndarray, M2: np.ndarray) -> np.ndarray:
     """Compose two 2x3 affine matrices M = M1 * M2"""
@@ -64,7 +57,7 @@ class AnnotationGUI:
         self.pairs = self._list_pairs()
         self.current_idx = 0
         
-        self.aligner = AutoAligner(workers=6)
+        self.aligner = AutoAligner()
         self.aligner.queue_pairs(self.pairs)
         
         self.window_name = "Manual Alignment UI"

@@ -5,8 +5,14 @@ from pathlib import Path
 # Add project root to path so 'overlap_detection' is discoverable
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from overlap_detection.config import RunConfig, DETECTOR_NAMES, DESCRIPTOR_NAMES
-from overlap_detection.orchestrator import run_experiment_matrix, build_full_matrix, list_image_pairs
+from overlap_detection.config import (
+    RunConfig, DETECTOR_NAMES, DESCRIPTOR_NAMES,
+    VALID_MASK_MODES, VALID_ESTIMATORS,
+)
+from overlap_detection.orchestrator import (
+    run_experiment_matrix, build_full_matrix, list_image_pairs,
+    default_experiment_workers,
+)
 from overlap_detection.types import GroundTruth
 import json
 import numpy as np
@@ -21,6 +27,12 @@ def parse_args():
     parser.add_argument("--mask-modes", type=str, default="fallback", help="Comma-separated list of mask modes (e.g. no_mask,mask,fallback).")
     parser.add_argument("--estimators", type=str, default="PROSAC", help="Comma-separated list of estimators (e.g. PROSAC,USAC_MAGSAC).")
     parser.add_argument("--max-pairs", type=int, default=None, help="Limit to the first N pairs (useful for quick tests).")
+    parser.add_argument(
+        "--workers", type=int, default=None,
+        help=(f"Number of worker processes (default: cpu_count-1 up to 8, "
+              f"resolved to {default_experiment_workers()} on this machine). "
+              "Pass 1 for serial execution."),
+    )
     parser.add_argument("--config", type=Path, help="Optional YAML config overrides.", default=None)
     return parser.parse_args()
 
@@ -44,9 +56,6 @@ def load_groundtruth(gt_dir: Path, img_a_stem: str, img_b_stem: str) -> GroundTr
     except Exception as e:
         print(f"Warning: could not load ground truth for {pair_id}: {e}")
         return None
-
-VALID_MASK_MODES = {"no_mask", "mask", "fallback"}
-VALID_ESTIMATORS = {"PROSAC", "USAC_MAGSAC"}
 
 def main():
     args = parse_args()
@@ -95,9 +104,10 @@ def main():
               "Check VALID_PAIRINGS in config.py.")
         return
 
+    n_workers = args.workers if args.workers is not None else default_experiment_workers()
     print(f"Running {len(configs)} configurations across {len(dataset_pairs)} image pairs "
-          f"({len(configs) * len(dataset_pairs)} total runs).")
-    run_experiment_matrix(dataset_pairs, configs, args.output_dir)
+          f"({len(configs) * len(dataset_pairs)} total runs) on {n_workers} worker(s).")
+    run_experiment_matrix(dataset_pairs, configs, args.output_dir, n_workers=n_workers)
 
 if __name__ == "__main__":
     main()

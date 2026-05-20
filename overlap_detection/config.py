@@ -80,6 +80,11 @@ VALID_PAIRINGS: dict[str, list[str]] = {
     "MSER":   _ALL_DESCRIPTORS,
 }
 
+# Valid values for mask_mode / estimator string fields.  Consumed by CLI
+# entrypoints (scripts/run_experiment.py) for upfront argument validation.
+VALID_MASK_MODES: set[str] = {"no_mask", "mask", "fallback"}
+VALID_ESTIMATORS: set[str] = {"PROSAC", "USAC_MAGSAC"}
+
 # ---------------------------------------------------------------------------
 # Runtime configuration
 # ---------------------------------------------------------------------------
@@ -186,6 +191,19 @@ class RunConfig:
     """Minimum inlier count required to accept a homography as valid.  Runs
     below this threshold are marked as failed and may trigger the fallback
     mask mode."""
+
+    # ------------------------------------------------------------------
+    # Quality gates (post-verification)
+    # ------------------------------------------------------------------
+
+    iou_threshold: float = 0.90
+    """Minimum overlap-polygon IoU vs. ground-truth required for a run to be
+    flagged ``"true"``.  Gate is skipped when no ground truth is available."""
+
+    rms_error_threshold_px: float = 10.0
+    """Maximum corner RMS error (pixels) vs. ground-truth corners required
+    for a run to be flagged ``"true"``.  Gate is skipped when no ground
+    truth is available."""
 
     # ------------------------------------------------------------------
     # I/O

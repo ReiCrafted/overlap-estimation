@@ -1,4 +1,5 @@
 import cv2
+import os
 import numpy as np
 from pathlib import Path
 from multiprocessing import Pool
@@ -6,6 +7,15 @@ import time
 
 from overlap_detection.config import RunConfig
 from overlap_detection.orchestrator import run_single_pair
+
+
+_DEFAULT_AUTO_ALIGN_WORKER_CAP = 6
+
+
+def default_auto_align_workers() -> int:
+    """Pick a worker count for background auto-alignment: ``cpu_count - 1``
+    capped at ``_DEFAULT_AUTO_ALIGN_WORKER_CAP`` and floored at 1."""
+    return max(1, min((os.cpu_count() or 1) - 1, _DEFAULT_AUTO_ALIGN_WORKER_CAP))
 
 
 def _align_worker(args: tuple[str, str, str]) -> tuple[str, np.ndarray | None]:
@@ -47,7 +57,9 @@ def _align_worker(args: tuple[str, str, str]) -> tuple[str, np.ndarray | None]:
 
 class AutoAligner:
     """Manages background auto-alignment of image pairs using multiprocessing."""
-    def __init__(self, workers: int = 6):
+    def __init__(self, workers: int | None = None):
+        if workers is None:
+            workers = default_auto_align_workers()
         self.pool = Pool(processes=workers)
         self.results = {}
         self._async_results = {}

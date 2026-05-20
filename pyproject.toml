@@ -1,1 +1,37 @@
-# pyproject.toml
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "overlap_detection"
+version = "0.1.0"
+description = "Comparative evaluation framework for feature-based image-pair overlap detection."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "Aleksis Reihmanis" }]
+dependencies = [
+    "numpy>=2.0.0",
+    "opencv-contrib-python>=4.8.0",
+    "shapely>=2.0.0",
+    "pandas>=2.0.0",
+    "matplotlib>=3.7.0",
+    "seaborn>=0.12.0",
+    "tqdm>=4.60.0",
+    "Pillow>=10.0.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0.0"]
+
+[project.scripts]
+overlap-run        = "scripts.run_experiment:main"
+overlap-annotate   = "scripts.annotate_dataset:main"
+overlap-report     = "scripts.generate_report:main"
+
+[tool.setuptools.packages.find]
+include = ["overlap_detection*"]
+exclude = ["tests*", "scripts*", "reports*", "results*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

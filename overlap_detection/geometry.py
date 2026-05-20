@@ -28,13 +28,21 @@ def compute_overlap_polygon(
     ], dtype=np.float32)
     
     A_in_B = apply_affine(A_corners, affine_matrix)
-    
+
     poly_A_in_B = Polygon(A_in_B)
     poly_B = Polygon(B_corners)
-    
+
     intersection_B = poly_B.intersection(poly_A_in_B)
-    
+
     if intersection_B.is_empty or intersection_B.geom_type not in ['Polygon', 'MultiPolygon']:
+        return np.empty((0, 2)), np.empty((0, 2))
+
+    # Singular 2x2 sub-matrix (zero/near-zero scale, collinear axes) makes
+    # invert_affine raise.  Treat as no-overlap to keep the metrics stage
+    # safe when called with a degenerate ground-truth annotation.
+    try:
+        inv_check = invert_affine(affine_matrix)
+    except np.linalg.LinAlgError:
         return np.empty((0, 2)), np.empty((0, 2))
         
     if intersection_B.geom_type == 'MultiPolygon':
@@ -52,8 +60,8 @@ def compute_overlap_polygon(
     start_idx = np.argmin(sums)
     overlap_in_B = np.roll(overlap_in_B, -start_idx, axis=0)
     
-    # Project back to A
-    inv_M = invert_affine(affine_matrix)
+    # Project back to A (reuse inverse computed in the sanity check above)
+    inv_M = inv_check
     overlap_in_A = apply_affine(overlap_in_B, inv_M)
 
     # An affine with negative determinant flips winding order on inversion.

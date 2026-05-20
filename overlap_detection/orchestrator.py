@@ -7,12 +7,14 @@ experimental matrix (detector × descriptor × mask_mode × estimator).
 
 import json
 import math
+import os
 import time
 import cv2
 import numpy as np
 from pathlib import Path
 from tqdm import tqdm
 from itertools import product
+from multiprocessing import get_context
 from typing import Optional
 from dataclasses import replace
 
@@ -26,6 +28,18 @@ from overlap_detection.matching import match
 from overlap_detection.verification import verify_affine
 from overlap_detection.geometry import compute_overlap_polygon
 from overlap_detection.reporting import write_pair_json, write_aggregate_csv
+
+
+# ---------------------------------------------------------------------------
+# Multi-core defaults
+# ---------------------------------------------------------------------------
+_DEFAULT_EXPERIMENT_WORKER_CAP = 8
+
+
+def default_experiment_workers() -> int:
+    """Pick a worker count for ``run_experiment_matrix``: ``cpu_count - 1``
+    capped at ``_DEFAULT_EXPERIMENT_WORKER_CAP`` and floored at 1."""
+    return max(1, min((os.cpu_count() or 1) - 1, _DEFAULT_EXPERIMENT_WORKER_CAP))
 
 # ---------------------------------------------------------------------------
 # Affine sanity filter
@@ -85,8 +99,48 @@ def list_image_pairs(dataset_dir: Path) -> list[tuple[Path, Path]]:
         for i in range(len(row_xs) - 1):
             pairs.append((coord_map[(row_xs[i], y)], coord_map[(row_xs[i + 1], y)]))
 
-    pairs.sort(key=lambda p: (_parse_coords(p[0]), _parse_coords(p[1])))
-    return pairs
+    # Decorate-sort-undecorate: parse each path once instead of per comparison.
+    decorated = [((_parse_coords(a), _parse_coords(b)), (a, b)) for a, b in pairs]
+    decorated.sort(key=lambda item: item[0])
+    return [pair for _, pair in decorated]
+
+
+# ---------------------------------------------------------------------------
+# Quality gates
+# ---------------------------------------------------------------------------
+
+
+def _apply_quality_gates(
+    result: PairResult,
+    metrics: dict,
+    iou_threshold: float,
+    rms_threshold_px: float,
+) -> None:
+    """Demote ``result.success`` to False if GT-derived gates are violated.
+
+    Mutates ``result`` and ``metrics`` in place.  Gates that require ground
+    truth (IoU, corner RMS) are skipped when those metrics are ``None`` — in
+    that case only the pipeline's existing gates (affine sanity, min inliers)
+    determine success.
+    """
+    if not result.success:
+        return
+
+    iou = metrics.get("iou")
+    if iou is not None and iou < iou_threshold:
+        result.success = False
+        result.error_message = (
+            f"IoU {iou:.3f} < {iou_threshold:.2f} (quality gate)"
+        )
+        return
+
+    rms = metrics.get("rms_corner_error")
+    if rms is not None and rms > rms_threshold_px:
+        result.success = False
+        result.error_message = (
+            f"Corner RMS {rms:.2f} px > {rms_threshold_px:.2f} px (quality gate)"
+        )
+        return
 
 
 def run_single_pair(
@@ -98,10 +152,22 @@ def run_single_pair(
     image_b_path: Path = Path("B.jpg"),
 ) -> tuple[PairResult, dict]:
     """Execute pipeline on one pair. Returns (result, metrics).
-    Handles fallback mask mode internally:
-    - If config.mask_mode == "fallback": try with no_mask first.
-      If inlier count < config.fallback_min_inliers, re-run with mask.
-      Record which mode actually succeeded in result.mask_mode."""
+
+    Quality gates (applied after metrics are computed): affine scale ±10 %,
+    rotation ±3 °, ``n_inliers ≥ fallback_min_inliers``, ``iou ≥ iou_threshold``,
+    ``rms_corner_error ≤ rms_error_threshold_px``.  IoU/RMS gates are skipped
+    when no ground truth is provided.
+
+    Sets ``result.quality_flag`` to one of:
+      * ``"true"``               — passed on the primary attempt.
+      * ``"false"``              — failed (non-fallback config).
+      * ``"true after false"``   — fallback re-run with mask succeeded after
+                                   the no-mask attempt failed.
+      * ``"false after false"``  — both fallback attempts failed.
+
+    For ``mask_mode == "fallback"``: try ``no_mask`` first, and if it does not
+    pass the gates, re-run with ``mask``.  Whichever attempt is returned has
+    ``result.mask_mode`` set to the mode that actually ran."""
 
     def execute_pipeline(mask_mode_to_use: str) -> tuple[PairResult, dict]:
         t_start_total = time.perf_counter()
@@ -213,21 +279,35 @@ def run_single_pair(
 
         result.time_total_s = time.perf_counter() - t_start_total
         metrics = compute_pair_metrics(result, ground_truth)
+        # GT-dependent quality gates may demote success after the fact.
+        _apply_quality_gates(
+            result, metrics,
+            config.iou_threshold, config.rms_error_threshold_px,
+        )
         return result, metrics
+
+    def _stamp(result: PairResult, metrics: dict, flag: str) -> None:
+        result.quality_flag = flag
+        metrics["quality_flag"] = flag
 
     if config.mask_mode == "fallback":
         # Try no_mask first
         res_no_mask, met_no_mask = execute_pipeline("no_mask")
         if res_no_mask.success:
+            _stamp(res_no_mask, met_no_mask, "true")
             return res_no_mask, met_no_mask
         # Fallback to stricter mask
         res_mask, met_mask = execute_pipeline("mask")
         res_mask.fallback_triggered = True
         res_mask.extra["fallback_reason"] = res_no_mask.error_message
         res_mask.extra["no_mask_metrics"] = met_no_mask
+        _stamp(res_mask, met_mask,
+               "true after false" if res_mask.success else "false after false")
         return res_mask, met_mask
     else:
-        return execute_pipeline(config.mask_mode)
+        res, met = execute_pipeline(config.mask_mode)
+        _stamp(res, met, "true" if res.success else "false")
+        return res, met
 
 
 def build_full_matrix(
@@ -255,82 +335,130 @@ def build_full_matrix(
     return configs
 
 
+def _read_rgb(path: Path) -> Optional[np.ndarray]:
+    """Read an image from disk and convert BGR→RGB.  Returns ``None`` on
+    any failure (missing file, unsupported codec, decode error)."""
+    try:
+        img = cv2.imread(str(path))
+    except Exception:
+        return None
+    if img is None:
+        return None
+    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+
+def _config_filename(pair_id: str, cfg: RunConfig) -> str:
+    return (f"{pair_id}_{cfg.detector}_{cfg.descriptor}"
+            f"_{cfg.estimator}_{cfg.mask_mode}.json")
+
+
+def _pair_worker(args):
+    """Run all pending configs for one image pair.
+
+    Returns ``(pair_id, metrics_list, error)``.  ``metrics_list`` contains the
+    metrics dict for each config that ran (or was loaded from cache); ``error``
+    is ``None`` on success or a short string when the pair could not be read.
+    """
+    image_A_path, image_B_path, gt, configs, output_dir = args
+    pair_id = f"{image_A_path.stem}_{image_B_path.stem}"
+
+    img_A = _read_rgb(image_A_path)
+    img_B = _read_rgb(image_B_path)
+    if img_A is None or img_B is None:
+        return pair_id, [], f"could not read {image_A_path.name} / {image_B_path.name}"
+
+    metrics_list: list[dict] = []
+    for cfg in configs:
+        json_path = output_dir / _config_filename(pair_id, cfg)
+        if json_path.exists():
+            try:
+                with open(json_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                metrics_list.append(data.get("metrics", {}))
+            except (OSError, json.JSONDecodeError):
+                pass
+            continue
+
+        try:
+            result, metrics = run_single_pair(
+                img_A, img_B, cfg, gt, image_A_path, image_B_path)
+        except Exception as e:
+            print(f"Error: run_single_pair crashed on {pair_id} "
+                  f"({cfg.detector}+{cfg.descriptor}): {e}")
+            continue
+
+        metrics["pair_id"] = pair_id
+        metrics["detector"] = cfg.detector
+        metrics["descriptor"] = cfg.descriptor
+        metrics["estimator"] = cfg.estimator
+        metrics["mask_mode"] = cfg.mask_mode
+        metrics_list.append(metrics)
+
+        try:
+            write_pair_json(result, metrics, output_dir)
+        except Exception as e:
+            print(f"Warning: could not write result for {pair_id} "
+                  f"({cfg.detector}+{cfg.descriptor}): {e}")
+
+    return pair_id, metrics_list, None
+
+
 def run_experiment_matrix(
     dataset_pairs: list[tuple[Path, Path, Optional[GroundTruth]]],
     configs: list[RunConfig],
     output_dir: Path,
+    n_workers: Optional[int] = None,
 ) -> None:
-    """Run all combinations of pairs × configs. Write per-pair JSONs
-    and aggregate CSV to output_dir. Progress bar via tqdm.
-    Resumes if partial results exist (skip already-completed runs)."""
+    """Run all combinations of pairs × configs.  Write per-pair JSONs and an
+    aggregate CSV into ``output_dir``.  Pairs are dispatched across a process
+    pool (each worker handles one pair × all its pending configs, loading the
+    images once).  Resumes by skipping any (pair, config) combination whose
+    JSON already exists.
 
-    all_metrics = []
+    Parameters
+    ----------
+    n_workers
+        Number of worker processes.  ``None`` (default) picks
+        :func:`default_experiment_workers`.  Pass ``1`` to force serial
+        execution (useful for debugging — the worker still runs in the same
+        process, no pool is spawned).
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
-    total_runs = len(dataset_pairs) * len(configs)
+    if n_workers is None:
+        n_workers = default_experiment_workers()
+    n_workers = max(1, n_workers)
+
+    worker_args = [
+        (img_a, img_b, gt, configs, output_dir)
+        for img_a, img_b, gt in dataset_pairs
+    ]
+
+    # Progress bar counts (pair, config) runs — including cached/skipped ones
+    # — so the user sees the full matrix size, not just what's left to do.
+    total_runs = sum(len(configs) for _ in dataset_pairs)
+    all_metrics: list[dict] = []
+
+    def consume(pair_id: str, metrics_list: list[dict], error: Optional[str]) -> None:
+        if error:
+            print(f"Warning: skipping pair {pair_id} — {error}.")
+        all_metrics.extend(metrics_list)
 
     with tqdm(total=total_runs, desc="Running Matrix") as pbar:
-        for image_A_path, image_B_path, gt in dataset_pairs:
-            pair_id = f"{image_A_path.stem}_{image_B_path.stem}"
-
-            # Preload images once per pair (avoid re-reading per config)
-            try:
-                img_A = cv2.imread(str(image_A_path))
-                if img_A is not None:
-                    img_A = cv2.cvtColor(img_A, cv2.COLOR_BGR2RGB)
-                img_B = cv2.imread(str(image_B_path))
-                if img_B is not None:
-                    img_B = cv2.cvtColor(img_B, cv2.COLOR_BGR2RGB)
-            except Exception as e:
-                print(f"Warning: could not load {image_A_path} or {image_B_path}: {e}")
-                img_A = None
-                img_B = None
-
-            if img_A is None or img_B is None:
-                print(f"Warning: skipping pair {pair_id} — image could not be read.")
-
-            for config in configs:
-                filename = (f"{pair_id}_{config.detector}_{config.descriptor}"
-                            f"_{config.estimator}_{config.mask_mode}.json")
-                json_path = output_dir / filename
-
-                if json_path.exists():
-                    # Resume: load existing metrics
-                    try:
-                        with open(json_path, 'r') as f:
-                            data = json.load(f)
-                            all_metrics.append(data.get("metrics", {}))
-                    except (json.JSONDecodeError, KeyError):
-                        pass
-                    pbar.update(1)
-                    continue
-
-                if img_A is None or img_B is None:
-                    pbar.update(1)
-                    continue
-
-                try:
-                    result, metrics = run_single_pair(
-                        img_A, img_B, config, gt, image_A_path, image_B_path)
-                except Exception as e:
-                    print(f"Error: run_single_pair crashed on {pair_id} "
-                          f"({config.detector}+{config.descriptor}): {e}")
-                    pbar.update(1)
-                    continue
-
-                # Add identification fields for the CSV
-                metrics["pair_id"] = pair_id
-                metrics["detector"] = config.detector
-                metrics["descriptor"] = config.descriptor
-                metrics["estimator"] = config.estimator
-                metrics["mask_mode"] = config.mask_mode
-
-                all_metrics.append(metrics)
-                try:
-                    write_pair_json(result, metrics, output_dir)
-                except Exception as e:
-                    print(f"Warning: could not write result for {pair_id} "
-                          f"({config.detector}+{config.descriptor}): {e}")
-                pbar.update(1)
+        if n_workers == 1:
+            for args in worker_args:
+                pair_id, metrics_list, error = _pair_worker(args)
+                consume(pair_id, metrics_list, error)
+                pbar.update(len(configs))
+        else:
+            # Use "spawn" so workers don't inherit OpenCV state / GUI handles
+            # from the parent — required on Windows and safer on POSIX.
+            ctx = get_context("spawn")
+            with ctx.Pool(processes=n_workers) as pool:
+                for pair_id, metrics_list, error in pool.imap_unordered(
+                    _pair_worker, worker_args
+                ):
+                    consume(pair_id, metrics_list, error)
+                    pbar.update(len(configs))
 
     if all_metrics:
         try:
