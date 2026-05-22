@@ -3,6 +3,11 @@
 Runs one image pair through the full pipeline (preprocess → detect →
 describe → match → verify → geometry → metrics) and iterates over the
 experimental matrix (detector × descriptor × mask_mode × estimator).
+
+The ``mask_mode = "both"`` value schedules two pipeline attempts per pair —
+one without mask, one with mask — and merges their results into a single
+CSV row whose ``no_mask_*`` / ``with_mask_*`` columns are paired.  Each
+attempt still produces its own JSON file.
 """
 
 import json
@@ -41,6 +46,7 @@ def default_experiment_workers() -> int:
     capped at ``_DEFAULT_EXPERIMENT_WORKER_CAP`` and floored at 1."""
     return max(1, min((os.cpu_count() or 1) - 1, _DEFAULT_EXPERIMENT_WORKER_CAP))
 
+
 # ---------------------------------------------------------------------------
 # Affine sanity filter
 # ---------------------------------------------------------------------------
@@ -51,9 +57,9 @@ _MAX_ROTATION_DEG = 3.0  # reject if |rotation| > 3 °
 def _affine_is_sane(affine_mat: np.ndarray) -> tuple[bool, float, float]:
     """Check scale and rotation of a 2×3 affine matrix.
 
-    Returns (is_sane, scale, rotation_deg).
-    Scale is the column-0 norm of the 2×2 sub-matrix; rotation is atan2(a10, a00).
-    A pure translation has scale=1.0, rotation=0.0.
+    Returns (is_sane, scale, rotation_deg).  Scale is the column-0 norm of
+    the 2×2 sub-matrix; rotation is ``atan2(a10, a00)``.  A pure translation
+    has scale=1.0, rotation=0.0.
     """
     a00, a10 = float(affine_mat[0, 0]), float(affine_mat[1, 0])
     scale = math.sqrt(a00 ** 2 + a10 ** 2)
@@ -106,106 +112,60 @@ def list_image_pairs(dataset_dir: Path) -> list[tuple[Path, Path]]:
 
 
 # ---------------------------------------------------------------------------
-# Quality gates
+# Single-attempt pipeline
 # ---------------------------------------------------------------------------
 
 
-def _apply_quality_gates(
-    result: PairResult,
-    metrics: dict,
-    iou_threshold: float,
-    rms_threshold_px: float,
-) -> None:
-    """Demote ``result.success`` to False if GT-derived gates are violated.
-
-    Mutates ``result`` and ``metrics`` in place.  Gates that require ground
-    truth (IoU, corner RMS) are skipped when those metrics are ``None`` — in
-    that case only the pipeline's existing gates (affine sanity, min inliers)
-    determine success.
-    """
-    if not result.success:
-        return
-
-    iou = metrics.get("iou")
-    if iou is not None and iou < iou_threshold:
-        result.success = False
-        result.error_message = (
-            f"IoU {iou:.3f} < {iou_threshold:.2f} (quality gate)"
-        )
-        return
-
-    rms = metrics.get("rms_corner_error")
-    if rms is not None and rms > rms_threshold_px:
-        result.success = False
-        result.error_message = (
-            f"Corner RMS {rms:.2f} px > {rms_threshold_px:.2f} px (quality gate)"
-        )
-        return
-
-
-def run_single_pair(
+def _execute_pipeline(
     image_A: np.ndarray,
     image_B: np.ndarray,
     config: RunConfig,
-    ground_truth: Optional[GroundTruth] = None,
-    image_a_path: Path = Path("A.jpg"),
-    image_b_path: Path = Path("B.jpg"),
+    mask_mode_to_use: str,
+    ground_truth: Optional[GroundTruth],
+    image_a_path: Path,
+    image_b_path: Path,
 ) -> tuple[PairResult, dict]:
-    """Execute pipeline on one pair. Returns (result, metrics).
+    """Run the full pipeline once with a concrete mask mode.
 
-    Quality gates (applied after metrics are computed): affine scale ±10 %,
-    rotation ±3 °, ``n_inliers ≥ fallback_min_inliers``, ``iou ≥ iou_threshold``,
-    ``rms_corner_error ≤ rms_error_threshold_px``.  IoU/RMS gates are skipped
-    when no ground truth is provided.
+    Always returns ``(result, metrics)``.  ``result.affine_matrix`` is set
+    only when the affine passes both the inlier-count gate and the sanity
+    check; ``metrics["result_label"]`` is assigned by ``compute_pair_metrics``.
+    """
+    t_start_total = time.perf_counter()
 
-    Sets ``result.quality_flag`` to one of:
-      * ``"true"``               — passed on the primary attempt.
-      * ``"false"``              — failed (non-fallback config).
-      * ``"true after false"``   — fallback re-run with mask succeeded after
-                                   the no-mask attempt failed.
-      * ``"false after false"``  — both fallback attempts failed.
+    result = PairResult(
+        image_a_path=image_a_path,
+        image_b_path=image_b_path,
+        detector=config.detector,
+        descriptor=config.descriptor,
+        estimator=config.estimator,
+        mask_mode=mask_mode_to_use,
+    )
 
-    For ``mask_mode == "fallback"``: try ``no_mask`` first, and if it does not
-    pass the gates, re-run with ``mask``.  Whichever attempt is returned has
-    ``result.mask_mode`` set to the mode that actually ran."""
+    try:
+        # 1. Preprocessing (masking)
+        mask_A = apply_mask_mode(image_A, mask_mode_to_use,
+                                 config.overlap_band_fraction,
+                                 config.rgb_gray_threshold,
+                                 side="right")
+        mask_B = apply_mask_mode(image_B, mask_mode_to_use,
+                                 config.overlap_band_fraction,
+                                 config.rgb_gray_threshold,
+                                 side="left")
 
-    def execute_pipeline(mask_mode_to_use: str) -> tuple[PairResult, dict]:
-        t_start_total = time.perf_counter()
+        # 2. Detection
+        t0 = time.perf_counter()
+        kps_A = detect(image_A, mask_A, config.detector,
+                       config.detector_params, config.max_keypoints)
+        kps_B = detect(image_B, mask_B, config.detector,
+                       config.detector_params, config.max_keypoints)
+        result.time_detection_s = time.perf_counter() - t0
+        result.n_kp_a = len(kps_A)
+        result.n_kp_b = len(kps_B)
 
-        result = PairResult(
-            image_a_path=image_a_path,
-            image_b_path=image_b_path,
-            detector=config.detector,
-            descriptor=config.descriptor,
-            estimator=config.estimator,
-            mask_mode=mask_mode_to_use,
-        )
-
-        try:
-            # 1. Preprocessing (Masking)
-            mask_A = apply_mask_mode(image_A, mask_mode_to_use,
-                                     config.overlap_band_fraction,
-                                     config.rgb_gray_threshold,
-                                     side="right")
-            mask_B = apply_mask_mode(image_B, mask_mode_to_use,
-                                     config.overlap_band_fraction,
-                                     config.rgb_gray_threshold,
-                                     side="left")
-
-            # 2. Detection
-            t0 = time.perf_counter()
-            kps_A = detect(image_A, mask_A, config.detector,
-                           config.detector_params, config.max_keypoints)
-            kps_B = detect(image_B, mask_B, config.detector,
-                           config.detector_params, config.max_keypoints)
-            result.time_detection_s = time.perf_counter() - t0
-            result.n_kp_a = len(kps_A)
-            result.n_kp_b = len(kps_B)
-
-            if len(kps_A) < 3 or len(kps_B) < 3:
-                result.error_message = "Not enough keypoints detected."
-                return result, compute_pair_metrics(result, ground_truth)
-
+        if len(kps_A) < 3 or len(kps_B) < 3:
+            result.error_message = "Not enough keypoints detected."
+        else:
             # 3. Description
             t0 = time.perf_counter()
             filtered_kps_A, desc_A = describe(
@@ -218,96 +178,100 @@ def run_single_pair(
 
             if len(filtered_kps_A) < 3 or len(filtered_kps_B) < 3:
                 result.error_message = "Not enough keypoints after description."
-                return result, compute_pair_metrics(result, ground_truth)
-
-            # 4. Matching
-            # LIOP descriptors cluster tightly in distance space, making the
-            # NNDR ratio always ≈ 1.0 and killing all matches.  Use plain MNN
-            # (no ratio test) so PROSAC/RANSAC can filter the noisier match set.
-            t0 = time.perf_counter()
-            is_bin = is_binary_descriptor(config.descriptor)
-            matcher_filter = ("mnn" if config.descriptor == "LIOP"
-                              else config.matcher_filter)
-            matches = match(desc_A, desc_B, is_bin,
-                            matcher_filter, config.nndr_threshold)
-            result.time_matching_s = time.perf_counter() - t0
-            result.n_raw_matches = len(matches)
-
-            if len(matches) < 3:
-                result.error_message = "Not enough tentative matches."
-                return result, compute_pair_metrics(result, ground_truth)
-
-            # 5. Verification
-            t0 = time.perf_counter()
-            affine_mat, inliers = verify_affine(
-                matches, filtered_kps_A, filtered_kps_B,
-                config.estimator, config.ransac_threshold_px,
-                config.ransac_max_iters, config.ransac_confidence)
-            result.time_verification_s = time.perf_counter() - t0
-
-            if affine_mat is not None:
-                result.n_inliers = int(np.sum(inliers))
-                if result.n_inliers >= config.fallback_min_inliers:
-                    # Sanity-check scale and rotation before accepting
-                    sane, scale, rot_deg = _affine_is_sane(affine_mat)
-                    if not sane:
-                        result.error_message = (
-                            f"Affine rejected: scale={scale:.3f} "
-                            f"(diff={abs(scale-1)*100:.1f}%), "
-                            f"rotation={rot_deg:.2f}°")
-                    else:
-                        result.affine_matrix = affine_mat
-                        result.inlier_mask = inliers
-                        result.success = True
-
-                        # 6. Geometry
-                        t0 = time.perf_counter()
-                        poly_A, poly_B = compute_overlap_polygon(
-                            affine_mat, image_A.shape, image_B.shape)
-                        result.time_geometry_s = time.perf_counter() - t0
-                        result.overlap_polygon_a = poly_A
-                        result.overlap_polygon_b = poly_B
-                else:
-                    result.error_message = (
-                        f"Too few inliers ({result.n_inliers} "
-                        f"< {config.fallback_min_inliers})")
             else:
-                result.error_message = "Affine estimation failed."
+                # 4. Matching
+                # LIOP descriptors cluster tightly in distance space, making
+                # the NNDR ratio ≈ 1.0 and killing all matches.  Use plain
+                # MNN so PROSAC/RANSAC can filter the noisier set itself.
+                t0 = time.perf_counter()
+                is_bin = is_binary_descriptor(config.descriptor)
+                matcher_filter = ("mnn" if config.descriptor == "LIOP"
+                                  else config.matcher_filter)
+                matches = match(desc_A, desc_B, is_bin,
+                                matcher_filter, config.nndr_threshold)
+                result.time_matching_s = time.perf_counter() - t0
+                result.n_raw_matches = len(matches)
 
-        except Exception as e:
-            result.error_message = f"Exception: {str(e)}"
+                if len(matches) < 3:
+                    result.error_message = "Not enough tentative matches."
+                else:
+                    # 5. Verification
+                    t0 = time.perf_counter()
+                    affine_mat, inliers = verify_affine(
+                        matches, filtered_kps_A, filtered_kps_B,
+                        config.estimator, config.ransac_threshold_px,
+                        config.ransac_max_iters, config.ransac_confidence)
+                    result.time_verification_s = time.perf_counter() - t0
 
-        result.time_total_s = time.perf_counter() - t_start_total
-        metrics = compute_pair_metrics(result, ground_truth)
-        # GT-dependent quality gates may demote success after the fact.
-        _apply_quality_gates(
-            result, metrics,
-            config.iou_threshold, config.rms_error_threshold_px,
-        )
-        return result, metrics
+                    if affine_mat is None:
+                        result.error_message = "Affine estimation failed."
+                    else:
+                        result.n_inliers = int(np.sum(inliers))
+                        if result.n_inliers < config.min_inliers:
+                            result.error_message = (
+                                f"Too few inliers ({result.n_inliers} "
+                                f"< {config.min_inliers})")
+                        else:
+                            sane, scale, rot_deg = _affine_is_sane(affine_mat)
+                            if not sane:
+                                result.error_message = (
+                                    f"Affine rejected: scale={scale:.3f} "
+                                    f"(diff={abs(scale-1)*100:.1f}%), "
+                                    f"rotation={rot_deg:.2f}°")
+                            else:
+                                result.affine_matrix = affine_mat
+                                result.inlier_mask = inliers
 
-    def _stamp(result: PairResult, metrics: dict, flag: str) -> None:
-        result.quality_flag = flag
-        metrics["quality_flag"] = flag
+                                # 6. Geometry
+                                t0 = time.perf_counter()
+                                poly_A, poly_B = compute_overlap_polygon(
+                                    affine_mat, image_A.shape, image_B.shape)
+                                result.time_geometry_s = time.perf_counter() - t0
+                                result.overlap_polygon_a = poly_A
+                                result.overlap_polygon_b = poly_B
 
-    if config.mask_mode == "fallback":
-        # Try no_mask first
-        res_no_mask, met_no_mask = execute_pipeline("no_mask")
-        if res_no_mask.success:
-            _stamp(res_no_mask, met_no_mask, "true")
-            return res_no_mask, met_no_mask
-        # Fallback to stricter mask
-        res_mask, met_mask = execute_pipeline("mask")
-        res_mask.fallback_triggered = True
-        res_mask.extra["fallback_reason"] = res_no_mask.error_message
-        res_mask.extra["no_mask_metrics"] = met_no_mask
-        _stamp(res_mask, met_mask,
-               "true after false" if res_mask.success else "false after false")
-        return res_mask, met_mask
+    except Exception as e:
+        result.error_message = f"Exception: {str(e)}"
+
+    result.time_total_s = time.perf_counter() - t_start_total
+    metrics = compute_pair_metrics(
+        result, ground_truth, config.accuracy_tiers_px,
+    )
+    return result, metrics
+
+
+def run_single_pair(
+    image_A: np.ndarray,
+    image_B: np.ndarray,
+    config: RunConfig,
+    ground_truth: Optional[GroundTruth] = None,
+    image_a_path: Path = Path("A.jpg"),
+    image_b_path: Path = Path("B.jpg"),
+) -> list[tuple[PairResult, dict]]:
+    """Execute the pipeline for one pair.
+
+    Returns a list of ``(PairResult, metrics)`` tuples — one per mask attempt:
+
+    * ``mask_mode == "no_mask"`` / ``"mask"``: list of length 1.
+    * ``mask_mode == "both"``: list of length 2 (no_mask first, then mask).
+
+    Each attempt is an independent pipeline invocation: no shared state, no
+    early-exit between attempts.
+    """
+    if config.mask_mode == "both":
+        modes = ("no_mask", "mask")
+    elif config.mask_mode in ("no_mask", "mask"):
+        modes = (config.mask_mode,)
     else:
-        res, met = execute_pipeline(config.mask_mode)
-        _stamp(res, met, "true" if res.success else "false")
-        return res, met
+        raise ValueError(f"Unknown mask_mode: {config.mask_mode!r}")
+
+    return [
+        _execute_pipeline(
+            image_A, image_B, config, m, ground_truth,
+            image_a_path, image_b_path,
+        )
+        for m in modes
+    ]
 
 
 def build_full_matrix(
@@ -335,6 +299,11 @@ def build_full_matrix(
     return configs
 
 
+# ---------------------------------------------------------------------------
+# Experiment matrix runner
+# ---------------------------------------------------------------------------
+
+
 def _read_rgb(path: Path) -> Optional[np.ndarray]:
     """Read an image from disk and convert BGR→RGB.  Returns ``None`` on
     any failure (missing file, unsupported codec, decode error)."""
@@ -347,60 +316,131 @@ def _read_rgb(path: Path) -> Optional[np.ndarray]:
     return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
 
-def _config_filename(pair_id: str, cfg: RunConfig) -> str:
+def _attempt_filename(pair_id: str, cfg: RunConfig, attempt_mode: str) -> str:
+    """JSON filename for a single mask attempt.  ``attempt_mode`` is always
+    the concrete mode that ran (``"no_mask"`` or ``"mask"``), never
+    ``"both"``."""
     return (f"{pair_id}_{cfg.detector}_{cfg.descriptor}"
-            f"_{cfg.estimator}_{cfg.mask_mode}.json")
+            f"_{cfg.estimator}_{attempt_mode}.json")
+
+
+def _attempt_modes_for(cfg: RunConfig) -> tuple[str, ...]:
+    if cfg.mask_mode == "both":
+        return ("no_mask", "mask")
+    return (cfg.mask_mode,)
+
+
+_ATTEMPT_COLUMN_PREFIX = {"no_mask": "no_mask", "mask": "with_mask"}
+
+# Per-attempt stat keys that get suffixed and merged into the CSV row.
+_ATTEMPT_STAT_KEYS = (
+    "result_label", "iou", "rms_corner_error",
+    "num_keypoints_A", "num_keypoints_B",
+    "num_tentative_matches", "num_inliers", "inlier_ratio",
+    "detection_ms", "description_ms", "matching_ms",
+    "verification_ms", "geometry_ms", "total_ms",
+)
+
+
+def _attempt_row_fragment(attempt_mode: str, metrics: dict) -> dict:
+    """Project ``metrics`` into per-attempt CSV columns, prefixed with
+    ``"no_mask_"`` or ``"with_mask_"``."""
+    prefix = _ATTEMPT_COLUMN_PREFIX[attempt_mode]
+    out: dict = {}
+    for k in _ATTEMPT_STAT_KEYS:
+        if k in metrics:
+            out[f"{prefix}_{k}"] = metrics[k]
+    # Friendly aliases for the most-used columns (saves a join in pandas).
+    if "result_label" in metrics:
+        out[f"{prefix}_result"] = metrics["result_label"]
+    if "rms_corner_error" in metrics:
+        out[f"{prefix}_rms"] = metrics["rms_corner_error"]
+    return out
+
+
+def _load_cached_metrics(json_path: Path) -> Optional[dict]:
+    """Read the ``metrics`` block from a previously-written per-attempt JSON.
+    Returns ``None`` if the file is missing or unreadable."""
+    if not json_path.exists():
+        return None
+    try:
+        with open(json_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data.get("metrics") if isinstance(data, dict) else None
 
 
 def _pair_worker(args):
     """Run all pending configs for one image pair.
 
-    Returns ``(pair_id, metrics_list, error)``.  ``metrics_list`` contains the
-    metrics dict for each config that ran (or was loaded from cache); ``error``
-    is ``None`` on success or a short string when the pair could not be read.
+    Returns ``(pair_id, rows, error)`` where ``rows`` is a list of merged
+    CSV row dicts (one per config) and ``error`` is a short string when the
+    images could not be read.
     """
     image_A_path, image_B_path, gt, configs, output_dir = args
     pair_id = f"{image_A_path.stem}_{image_B_path.stem}"
 
-    img_A = _read_rgb(image_A_path)
-    img_B = _read_rgb(image_B_path)
-    if img_A is None or img_B is None:
-        return pair_id, [], f"could not read {image_A_path.name} / {image_B_path.name}"
+    # Lazy image load: only read if at least one attempt is missing a cached JSON.
+    img_A: Optional[np.ndarray] = None
+    img_B: Optional[np.ndarray] = None
+    rows: list[dict] = []
 
-    metrics_list: list[dict] = []
     for cfg in configs:
-        json_path = output_dir / _config_filename(pair_id, cfg)
-        if json_path.exists():
+        attempt_modes = _attempt_modes_for(cfg)
+        row: dict = {
+            "pair_id": pair_id,
+            "detector": cfg.detector,
+            "descriptor": cfg.descriptor,
+            "estimator": cfg.estimator,
+            "mask_mode": cfg.mask_mode,
+        }
+
+        for attempt_mode in attempt_modes:
+            json_path = output_dir / _attempt_filename(pair_id, cfg, attempt_mode)
+            cached = _load_cached_metrics(json_path)
+            if cached is not None:
+                row.update(_attempt_row_fragment(attempt_mode, cached))
+                continue
+
+            # Need to actually run — load images on first miss for this pair.
+            if img_A is None or img_B is None:
+                img_A = _read_rgb(image_A_path)
+                img_B = _read_rgb(image_B_path)
+                if img_A is None or img_B is None:
+                    return pair_id, [], (
+                        f"could not read {image_A_path.name} / {image_B_path.name}"
+                    )
+
             try:
-                with open(json_path, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                metrics_list.append(data.get("metrics", {}))
-            except (OSError, json.JSONDecodeError):
-                pass
-            continue
+                result, metrics = _execute_pipeline(
+                    img_A, img_B, cfg, attempt_mode, gt,
+                    image_A_path, image_B_path,
+                )
+            except Exception as e:
+                print(f"Error: pipeline crashed on {pair_id} "
+                      f"({cfg.detector}+{cfg.descriptor}+{attempt_mode}): {e}")
+                continue
 
-        try:
-            result, metrics = run_single_pair(
-                img_A, img_B, cfg, gt, image_A_path, image_B_path)
-        except Exception as e:
-            print(f"Error: run_single_pair crashed on {pair_id} "
-                  f"({cfg.detector}+{cfg.descriptor}): {e}")
-            continue
+            # Stamp identifying fields on the metrics dict (echoed into JSON).
+            metrics["pair_id"] = pair_id
+            metrics["detector"] = cfg.detector
+            metrics["descriptor"] = cfg.descriptor
+            metrics["estimator"] = cfg.estimator
+            metrics["mask_mode_spec"] = cfg.mask_mode
+            metrics["attempt_mode"] = attempt_mode
 
-        metrics["pair_id"] = pair_id
-        metrics["detector"] = cfg.detector
-        metrics["descriptor"] = cfg.descriptor
-        metrics["estimator"] = cfg.estimator
-        metrics["mask_mode"] = cfg.mask_mode
-        metrics_list.append(metrics)
+            try:
+                write_pair_json(result, metrics, output_dir)
+            except Exception as e:
+                print(f"Warning: could not write JSON for {pair_id} "
+                      f"({cfg.detector}+{cfg.descriptor}+{attempt_mode}): {e}")
 
-        try:
-            write_pair_json(result, metrics, output_dir)
-        except Exception as e:
-            print(f"Warning: could not write result for {pair_id} "
-                  f"({cfg.detector}+{cfg.descriptor}): {e}")
+            row.update(_attempt_row_fragment(attempt_mode, metrics))
 
-    return pair_id, metrics_list, None
+        rows.append(row)
+
+    return pair_id, rows, None
 
 
 def run_experiment_matrix(
@@ -409,11 +449,12 @@ def run_experiment_matrix(
     output_dir: Path,
     n_workers: Optional[int] = None,
 ) -> None:
-    """Run all combinations of pairs × configs.  Write per-pair JSONs and an
-    aggregate CSV into ``output_dir``.  Pairs are dispatched across a process
-    pool (each worker handles one pair × all its pending configs, loading the
-    images once).  Resumes by skipping any (pair, config) combination whose
-    JSON already exists.
+    """Run all combinations of pairs × configs.  Write per-attempt JSONs and
+    one aggregated CSV row per ``(pair, detector, descriptor, estimator,
+    mask_mode)`` into ``output_dir``.  Pairs are dispatched across a process
+    pool (each worker handles one pair × all its pending configs, loading
+    the images once).  Resumes by re-using any per-attempt JSON that already
+    exists.
 
     Parameters
     ----------
@@ -433,35 +474,33 @@ def run_experiment_matrix(
         for img_a, img_b, gt in dataset_pairs
     ]
 
-    # Progress bar counts (pair, config) runs — including cached/skipped ones
-    # — so the user sees the full matrix size, not just what's left to do.
-    total_runs = sum(len(configs) for _ in dataset_pairs)
-    all_metrics: list[dict] = []
+    # Progress bar counts CSV rows per pair, not pipeline attempts — keeps
+    # the bar aligned with the scoreboard size the user actually sees.
+    total_rows = len(dataset_pairs) * len(configs)
+    all_rows: list[dict] = []
 
-    def consume(pair_id: str, metrics_list: list[dict], error: Optional[str]) -> None:
+    def consume(pair_id: str, rows: list[dict], error: Optional[str]) -> None:
         if error:
             print(f"Warning: skipping pair {pair_id} — {error}.")
-        all_metrics.extend(metrics_list)
+        all_rows.extend(rows)
 
-    with tqdm(total=total_runs, desc="Running Matrix") as pbar:
+    with tqdm(total=total_rows, desc="Running Matrix") as pbar:
         if n_workers == 1:
             for args in worker_args:
-                pair_id, metrics_list, error = _pair_worker(args)
-                consume(pair_id, metrics_list, error)
+                pair_id, rows, error = _pair_worker(args)
+                consume(pair_id, rows, error)
                 pbar.update(len(configs))
         else:
-            # Use "spawn" so workers don't inherit OpenCV state / GUI handles
-            # from the parent — required on Windows and safer on POSIX.
             ctx = get_context("spawn")
             with ctx.Pool(processes=n_workers) as pool:
-                for pair_id, metrics_list, error in pool.imap_unordered(
+                for pair_id, rows, error in pool.imap_unordered(
                     _pair_worker, worker_args
                 ):
-                    consume(pair_id, metrics_list, error)
+                    consume(pair_id, rows, error)
                     pbar.update(len(configs))
 
-    if all_metrics:
+    if all_rows:
         try:
-            write_aggregate_csv(all_metrics, output_dir / "aggregate_results.csv")
+            write_aggregate_csv(all_rows, output_dir / "aggregate_results.csv")
         except Exception as e:
             print(f"Error: could not write aggregate CSV: {e}")
