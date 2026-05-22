@@ -24,7 +24,7 @@ def parse_args():
     parser.add_argument("--output-dir", type=Path, required=True, help="Directory to save results.")
     parser.add_argument("--detectors", type=str, default=",".join(DETECTOR_NAMES), help="Comma-separated list of detectors to evaluate.")
     parser.add_argument("--descriptors", type=str, default=",".join(DESCRIPTOR_NAMES), help="Comma-separated list of descriptors to evaluate.")
-    parser.add_argument("--mask-modes", type=str, default="fallback", help="Comma-separated list of mask modes (e.g. no_mask,mask,fallback).")
+    parser.add_argument("--mask-modes", type=str, default="both", help="Comma-separated list of mask modes (no_mask, mask, both). 'both' runs each pair twice and pairs the results in one CSV row.")
     parser.add_argument("--estimators", type=str, default="PROSAC", help="Comma-separated list of estimators (e.g. PROSAC,USAC_MAGSAC).")
     parser.add_argument("--max-pairs", type=int, default=None, help="Limit to the first N pairs (useful for quick tests).")
     parser.add_argument(

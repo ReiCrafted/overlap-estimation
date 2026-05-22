@@ -5,6 +5,48 @@ from overlap_detection.types import PairResult, GroundTruth
 from overlap_detection.geometry import compute_overlap_polygon
 
 
+def _format_tier(t: float) -> str:
+    """Format a tier threshold for a ``"acc_at_..."`` label without trailing
+    zeros (``3.0 → "3"``, ``2.5 → "2.5"``)."""
+    return f"{t:g}"
+
+
+def categorize_result(
+    has_transform: bool,
+    rms_corner_error: float | None,
+    accuracy_tiers_px: tuple[float, ...] | list[float],
+) -> str:
+    """Map an attempt's outcome to its ordinal accuracy label.
+
+    Parameters
+    ----------
+    has_transform
+        Whether the pipeline produced an accepted affine matrix (i.e. it
+        survived the affine sanity check and the min-inliers gate).
+    rms_corner_error
+        Corner RMS error vs. ground truth, in pixels.  Must be supplied when
+        ``has_transform`` is ``True``; ignored otherwise.
+    accuracy_tiers_px
+        Tier thresholds; will be sorted ascending.
+
+    Returns
+    -------
+    label : str
+        One of ``"no_match"``, ``"false_match"``, or ``"acc_at_<T>"``.
+    """
+    if not has_transform:
+        return "no_match"
+    if rms_corner_error is None or not np.isfinite(rms_corner_error):
+        # Pipeline produced a transform but we have no GT-derived RMS to
+        # grade it against — treat as no_match to keep counts honest.  Real
+        # experiments are always run with ground truth (see project_overview).
+        return "no_match"
+    for t in sorted(accuracy_tiers_px):
+        if rms_corner_error <= t:
+            return f"acc_at_{_format_tier(t)}"
+    return "false_match"
+
+
 def per_corner_errors(
     predicted_corners: np.ndarray,   # Nx2 from compute_overlap_polygon
     ground_truth_corners: np.ndarray, # Nx2 from manual annotation
@@ -52,9 +94,12 @@ def overlap_iou(
 def compute_pair_metrics(
     result: PairResult,
     ground_truth: GroundTruth | None,
+    accuracy_tiers_px: tuple[float, ...] | list[float] = (3.0, 5.0, 10.0),
 ) -> dict:
-    """Compute all metrics for a single pair result. Returns a flat dict
-    suitable for CSV writing."""
+    """Compute all metrics for a single pair result.  Returns a flat dict
+    suitable for CSV writing.  Also assigns ``result.result_label`` based on
+    the configured ``accuracy_tiers_px`` and the measured corner RMS error.
+    """
     inlier_ratio = result.n_inliers / result.n_raw_matches if result.n_raw_matches > 0 else 0.0
 
     metrics = {
@@ -63,7 +108,6 @@ def compute_pair_metrics(
         "num_tentative_matches": result.n_raw_matches,
         "num_inliers": result.n_inliers,
         "inlier_ratio": float(inlier_ratio),
-        "estimation_succeeded": result.success,
         "detection_ms": result.time_detection_s * 1000,
         "description_ms": result.time_description_s * 1000,
         "matching_ms": result.time_matching_s * 1000,
@@ -76,6 +120,7 @@ def compute_pair_metrics(
         "corner_error_3": None,
         "rms_corner_error": None,
         "iou": None,
+        "result_label": "no_match",
     }
 
     if ground_truth is not None and result.overlap_polygon_a is not None and len(result.overlap_polygon_a) > 0:
@@ -92,4 +137,12 @@ def compute_pair_metrics(
                 metrics["rms_corner_error"] = overlap_rms_error(errors)
             metrics["iou"] = overlap_iou(result.overlap_polygon_a, gt_poly_A)
 
+    has_transform = result.affine_matrix is not None
+    label = categorize_result(
+        has_transform=has_transform,
+        rms_corner_error=metrics["rms_corner_error"],
+        accuracy_tiers_px=accuracy_tiers_px,
+    )
+    metrics["result_label"] = label
+    result.result_label = label
     return metrics

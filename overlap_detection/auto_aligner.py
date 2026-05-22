@@ -18,6 +18,28 @@ def default_auto_align_workers() -> int:
     return max(1, min((os.cpu_count() or 1) - 1, _DEFAULT_AUTO_ALIGN_WORKER_CAP))
 
 
+def _try_with_fallback(img_A: np.ndarray, img_B: np.ndarray,
+                       cfg_template: RunConfig) -> np.ndarray | None:
+    """Auto-aligner's self-contained fallback: try ``no_mask`` first, then
+    ``mask`` if the first attempt produced no transform.  Returns the first
+    accepted affine matrix or ``None`` if both attempts failed.
+
+    The main pipeline no longer has a ``"fallback"`` mask mode — the
+    auto-aligner owns that behaviour locally because it's the only consumer
+    that genuinely benefits from short-circuiting on first success (the
+    experiment runner always wants both attempts for analysis).
+    """
+    from dataclasses import replace
+    for mode in ("no_mask", "mask"):
+        cfg = replace(cfg_template, mask_mode=mode)
+        attempts = run_single_pair(img_A, img_B, cfg)
+        # mask_mode is concrete here, so attempts has length 1
+        result, _ = attempts[0]
+        if result.affine_matrix is not None:
+            return result.affine_matrix
+    return None
+
+
 def _align_worker(args: tuple[str, str, str]) -> tuple[str, np.ndarray | None]:
     """Worker function for multiprocessing pool.
     args: (pair_id, img_A_path, img_B_path)
@@ -36,19 +58,19 @@ def _align_worker(args: tuple[str, str, str]) -> tuple[str, np.ndarray | None]:
             return pair_id, None
 
         cfg_primary = RunConfig(
-            detector="GFTT", descriptor="BRISK", estimator="PROSAC", mask_mode="fallback"
+            detector="GFTT", descriptor="BRISK", estimator="PROSAC",
         )
-        res_primary, _ = run_single_pair(img_A, img_B, cfg_primary)
-        if res_primary.success and res_primary.affine_matrix is not None:
-            return pair_id, res_primary.affine_matrix
-            
-        cfg_fallback = RunConfig(
-            detector="FAST", descriptor="SIFT", estimator="PROSAC", mask_mode="fallback"
+        affine = _try_with_fallback(img_A, img_B, cfg_primary)
+        if affine is not None:
+            return pair_id, affine
+
+        cfg_secondary = RunConfig(
+            detector="FAST", descriptor="SIFT", estimator="PROSAC",
         )
-        res_fallback, _ = run_single_pair(img_A, img_B, cfg_fallback)
-        if res_fallback.success and res_fallback.affine_matrix is not None:
-            return pair_id, res_fallback.affine_matrix
-            
+        affine = _try_with_fallback(img_A, img_B, cfg_secondary)
+        if affine is not None:
+            return pair_id, affine
+
         return pair_id, None
     except Exception as e:
         print(f"Auto-align error on {pair_id}: {e}")

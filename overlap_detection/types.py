@@ -250,22 +250,23 @@ class PairResult:
     time_total_s: float = 0.0
 
     # --- Status -----------------------------------------------------------
-    fallback_triggered: bool = False
-    success: bool = False
     error_message: Optional[str] = None
 
-    quality_flag: str = "false"
-    """Post-gate outcome of the run.  One of:
+    result_label: str = "no_match"
+    """Ordinal accuracy categorisation of this attempt.  Derived at metrics
+    time from the configured ``RunConfig.accuracy_tiers_px`` and the measured
+    corner RMS error vs. ground truth.  Possible values:
 
-    * ``"true"``               — passed all quality gates on the primary attempt.
-    * ``"false"``              — failed (non-fallback config).
-    * ``"true after false"``   — fallback path was taken; mask-mode attempt
-                                 passed after no-mask attempt failed.
-    * ``"false after false"``  — both fallback attempts failed.
-
-    Gates: affine sanity (scale/rotation), inlier count, IoU ≥ threshold,
-    corner RMS error ≤ threshold.  GT-dependent gates are skipped if no
-    ground truth was supplied for the pair."""
+    * ``"no_match"``    — no transform produced (insufficient matches,
+                          affine-sanity rejection, or RANSAC failure).
+    * ``"false_match"`` — transform produced but corner RMS exceeded the
+                          loosest accuracy tier.
+    * ``"acc_at_<T>"``  — transform produced and corner RMS ≤ T px, where T
+                          is the smallest tier the result cleared (e.g.
+                          ``"acc_at_3"`` is strictly better than
+                          ``"acc_at_5"`` which is strictly better than
+                          ``"acc_at_10"``).
+    """
 
     # --- Extensible metadata ---------------------------------------------
     extra: dict = field(default_factory=dict)

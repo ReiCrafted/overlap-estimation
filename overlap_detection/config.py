@@ -82,7 +82,7 @@ VALID_PAIRINGS: dict[str, list[str]] = {
 
 # Valid values for mask_mode / estimator string fields.  Consumed by CLI
 # entrypoints (scripts/run_experiment.py) for upfront argument validation.
-VALID_MASK_MODES: set[str] = {"no_mask", "mask", "fallback"}
+VALID_MASK_MODES: set[str] = {"no_mask", "mask", "both"}
 VALID_ESTIMATORS: set[str] = {"PROSAC", "USAC_MAGSAC"}
 
 # ---------------------------------------------------------------------------
@@ -104,12 +104,14 @@ class RunConfig:
     # Mask / preprocessing
     # ------------------------------------------------------------------
 
-    mask_mode: str = "fallback"
-    """Masking strategy: ``"no_mask"`` | ``"mask"`` | ``"fallback"``.
+    mask_mode: str = "both"
+    """Masking strategy: ``"no_mask"`` | ``"mask"`` | ``"both"``.
 
-    * ``no_mask``  — process full images.
-    * ``mask``     — apply greenness / tray mask; fail if mask is empty.
-    * ``fallback`` — try masked mode, revert to unmasked if mask is degenerate.
+    * ``no_mask`` — process full images.
+    * ``mask``    — apply greenness / tray mask.
+    * ``both``    — run the pair twice (once with each mode) and emit a
+      single CSV row whose ``no_mask_*`` and ``with_mask_*`` columns are
+      both populated.  Per-attempt JSON files are still written separately.
     """
 
     rgb_gray_threshold: int = 15
@@ -184,26 +186,20 @@ class RunConfig:
     """Desired probability that the estimated model is free of outliers."""
 
     # ------------------------------------------------------------------
-    # Fallback / quality gate
+    # Acceptance / categorisation
     # ------------------------------------------------------------------
 
-    fallback_min_inliers: int = 8
-    """Minimum inlier count required to accept a homography as valid.  Runs
-    below this threshold are marked as failed and may trigger the fallback
-    mask mode."""
+    min_inliers: int = 8
+    """Minimum inlier count for an estimated affine to be retained.  An
+    estimate that fails this gate (or the affine sanity check) yields the
+    ``"no_match"`` categorical result."""
 
-    # ------------------------------------------------------------------
-    # Quality gates (post-verification)
-    # ------------------------------------------------------------------
-
-    iou_threshold: float = 0.90
-    """Minimum overlap-polygon IoU vs. ground-truth required for a run to be
-    flagged ``"true"``.  Gate is skipped when no ground truth is available."""
-
-    rms_error_threshold_px: float = 10.0
-    """Maximum corner RMS error (pixels) vs. ground-truth corners required
-    for a run to be flagged ``"true"``.  Gate is skipped when no ground
-    truth is available."""
+    accuracy_tiers_px: tuple[float, ...] = (3.0, 5.0, 10.0)
+    """Corner-RMS thresholds (px) that define the ordinal accuracy tiers
+    used to label each attempt's ``*_result`` column.  Sorted ascending at
+    use time.  A pair whose corner RMS is ≤ the smallest tier is labelled
+    ``"acc_at_<smallest>"``; if greater than the largest tier it is labelled
+    ``"false_match"``; if no transform was produced it is ``"no_match"``."""
 
     # ------------------------------------------------------------------
     # I/O
