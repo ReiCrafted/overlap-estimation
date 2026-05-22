@@ -5,32 +5,34 @@
 ```
 Overlap_Estimation/
 ├── .gitignore                 # Specifies intentionally untracked files to ignore
-├── pyproject.toml             # Configuration for packaging and building the project
-├── project_overview.md        # This repository layout description
+├── LICENSE                    # MIT
+├── README.md                  # Top-level entry point with quick-start commands
+├── pyproject.toml             # Packaging metadata and dependencies
+├── project_overview.md        # This document — architecture, data contracts, outputs
 ├── overlap_detection/         # Main Python source package
-│   ├── __init__.py            # Marks the directory as a Python package
-│   ├── config.py              # RunConfig dataclass for parameters
+│   ├── __init__.py            # Public-API re-exports
+│   ├── config.py              # RunConfig, VALID_MASK_MODES, VALID_ESTIMATORS
 │   ├── types.py               # Shared dataclasses (Keypoint, PairResult, GroundTruth)
-│   ├── preprocessing.py       # Masking and colorfulness/grayness test calculations
-│   ├── detection.py           # Wrappers for feature detectors (SIFT, KAZE, etc.)
+│   ├── preprocessing.py       # Masking (overlap band + greenness/grayness)
+│   ├── detection.py           # OpenCV feature detector wrappers
 │   ├── description.py         # Descriptor dispatch; routes LIOP/MLDB to custom impls
 │   ├── liop.py                # Custom NumPy LIOP descriptor (144-dim float32)
 │   ├── mldb.py                # Custom NumPy MLDB descriptor (486-bit / 61-byte uint8)
-│   ├── matching.py            # Keypoint matching logic (BFMatcher, NNDR, MNN)
-│   ├── verification.py        # Robust geometric verification wrappers (USAC_MAGSAC)
-│   ├── geometry.py            # Homography to overlap polygon transformation logic
-│   ├── metrics.py             # Accuracy evaluation metrics (IoU, corner error)
-│   ├── reporting.py           # Writers for JSON/CSV results and plot generation
-│   ├── orchestrator.py        # Matrix/grid experiment runner
-│   └── annotation_gui.py      # Standalone alignment/ground truth labeling GUI
-├── tests/                     # Unit and integration tests
-│   └── __init__.py            # Test package initializer
-├── scripts/                   # CLI entrypoints for pipeline executions
-│   ├── run_experiment.py      # Runs the experimental matrix benchmarking
-│   ├── annotate_dataset.py    # Launches the Tkinter ground truth alignment GUI
-│   └── generate_report.py     # Parses experimental results and generates plots
-└── results/                   # Destination for CSV/JSON outputs and visualizations
-    └── .gitkeep               # Directory placeholder
+│   ├── matching.py            # Keypoint matching (BFMatcher, NNDR, MNN)
+│   ├── verification.py        # Robust affine estimation (PROSAC / USAC_MAGSAC)
+│   ├── geometry.py            # Overlap-polygon computation from affine
+│   ├── metrics.py             # IoU, mean corner error, result categorisation
+│   ├── reporting.py           # JSON/CSV writers + markdown summary report
+│   ├── orchestrator.py        # Pipeline runner + experiment matrix (multi-core)
+│   ├── auto_aligner.py        # Background auto-alignment for the annotation GUI
+│   └── annotation_gui.py      # Standalone Tkinter ground-truth labelling GUI
+├── tests/                     # Pytest suite (per-module)
+├── scripts/                   # CLI entrypoints
+│   ├── run_experiment.py      # Runs the experimental matrix
+│   ├── annotate_dataset.py    # Launches the annotation GUI
+│   └── generate_report.py     # Renders the markdown summary from aggregate CSV
+├── reports/                   # Committed example reports (markdown + future plots)
+└── results/                   # Per-pair JSONs + aggregate CSV (gitignored)
 ```
 
 ## Pipeline Architecture
@@ -39,8 +41,9 @@ The overlap detection system is built around a multi-stage sequential pipeline m
 
 1. **Stage 1: Preprocessing & Masking** (`preprocessing.py`)
    - Inputs: Images A and B.
-   - Outputs: Binary masks isolating regions of interest (e.g., green plants) using HSV-based color space thresholding or circular tray constraints.
-   - Modes: `no_mask`, `mask`, `fallback`.
+   - Outputs: Binary masks isolating regions of interest (e.g., green plants) using RGB-channel-range thresholding combined with an overlap-band mask along the gantry motion axis.
+   - Modes consumed by the per-attempt pipeline: `"no_mask"` (band-only) and `"mask"` (band ∧ grayness exclusion).
+   - The user-facing `RunConfig.mask_mode = "both"` is **scheduling-only** and does not reach this stage — the orchestrator expands it into one `"no_mask"` invocation and one `"mask"` invocation per pair (see Stage 8).
 
 2. **Stage 2: Detection** (`detection.py`)
    - Inputs: Preprocessed/masked images.
@@ -57,34 +60,39 @@ The overlap detection system is built around a multi-stage sequential pipeline m
 
 5. **Stage 5: Geometric Verification** (`verification.py`, `orchestrator.py`)
    - Inputs: Keypoint lists and matches.
-   - Outputs: Inliers mask and estimated affine transformation matrix (`verify_affine`) using robust estimators like `PROSAC` or `USAC_MAGSAC`.
-   - After RANSAC, `orchestrator.py` applies an **affine sanity filter** before accepting the result: the estimated matrix is decomposed into scale (column-0 norm of the 2×2 sub-matrix) and rotation (`atan2(a10, a00)`). If `|scale − 1| > 10%` or `|rotation| > 3°` the result is rejected with a descriptive error message and the pair is counted as failed. This catches geometrically implausible transforms that accumulate enough inliers to pass RANSAC but are physically impossible for near-planar, similarly-scaled adjacent image pairs. Thresholds are defined as `_MAX_SCALE_DIFF = 0.10` and `_MAX_ROTATION_DEG = 3.0` in `orchestrator.py`.
-   - After the metrics stage, two additional **post-verification quality gates** are applied when ground truth is available (see Stage 8).
+   - Outputs: Inliers mask and estimated affine transformation matrix (`verify_affine`) using `PROSAC` or `USAC_MAGSAC`.
+   - **Acceptance gates** (both applied before the affine is accepted):
+     1. **Min-inliers**: `n_inliers ≥ RunConfig.min_inliers` (default `8`).
+     2. **Affine sanity**: scale and rotation are decomposed from the 2×2 sub-matrix; the affine is rejected if `|scale − 1| > 10 %` or `|rotation| > 3°`. Catches geometrically implausible transforms that accumulate enough inliers to pass RANSAC but are impossible for near-planar, similarly-scaled adjacent image pairs. Thresholds: `_MAX_SCALE_DIFF = 0.10`, `_MAX_ROTATION_DEG = 3.0` in `orchestrator.py`.
+   - A failing attempt sets `result.affine_matrix = None`, `error_message`, and the categorisation stage labels it `"no_match"`.
 
 6. **Stage 6: Overlap Geometry** (`geometry.py`)
-   - Inputs: Estimated transformation matrix and image shapes.
-   - Outputs: Intersection bounding polygons of overlap regions and their corner coordinates.
+   - Inputs: Accepted affine matrix and the two image shapes.
+   - Outputs: Overlap polygon corners in both image frames.
 
-7. **Stage 7: Metrics & Reporting** (`metrics.py`, `reporting.py`)
-   - Inputs: Transformation results, keypoint matches, and ground truth polygons.
-   - Outputs: Computes IoU (Intersection over Union), corner error, aggregates metrics, and saves results (JSON/CSV) along with visualizations.
+7. **Stage 7: Metrics & Categorisation** (`metrics.py`)
+   - Inputs: `PairResult` (timings, counts, affine, polygons) and `GroundTruth`.
+   - Outputs: per-stage timings, keypoint/match/inlier counts, IoU vs. ground truth, **mean corner error** (mean Euclidean distance across the four overlap-polygon corners), and the **ordinal `result_label`** assigned by `categorize_result`.
+   - **Error metric.** Mean corner reprojection error (`metrics.mean_corner_error`), matching the HPatches / SuperGlue / LoFTR convention. This makes our acc@T rates and mAA directly comparable to numbers in published benchmark tables.
+   - **`result_label` values** (driven by `RunConfig.accuracy_tiers_px`, default `(3, 5, 10)` px):
+     - `"acc_at_<T>"` where T is the smallest configured tier the pair cleared (e.g. `"acc_at_3"` is strictly better than `"acc_at_5"` is strictly better than `"acc_at_10"`).
+     - `"false_match"` — pipeline produced an accepted affine but its corner error exceeded every configured tier.
+     - `"no_match"` — no affine was produced (insufficient keypoints/matches, RANSAC failure, or affine-sanity rejection).
 
 8. **Orchestration** (`orchestrator.py`)
-   - Manages matrix runs, pipeline execution loops, error fallbacks, and multi-configuration sweeps.
-   - **Quality gates and `quality_flag`.** After metrics are computed, `_apply_quality_gates` demotes `result.success` to `False` if any of these GT-dependent thresholds are violated:
-     - `iou < RunConfig.iou_threshold` (default `0.90`)
-     - `rms_corner_error > RunConfig.rms_error_threshold_px` (default `10.0` px)
-     Combined with the affine sanity check and the `fallback_min_inliers` gate, this gives a strict pass/fail outcome per run. The result is stamped with a `quality_flag` string:
-     - `"true"`               — passed all gates on the primary attempt.
-     - `"false"`              — failed (non-fallback configuration).
-     - `"true after false"`   — fallback path was taken; the mask-mode attempt passed after the no-mask attempt failed.
-     - `"false after false"`  — both fallback attempts failed.
-     GT-dependent gates (IoU, RMS) are skipped when no ground truth is supplied for the pair, in which case only the affine sanity / inlier-count gates determine `success`.
-   - **Multi-core execution.** `run_experiment_matrix` accepts `n_workers` and fans pairs out across a process pool. Each worker reads one image pair once and runs every pending configuration for it, writing per-`(pair, config)` JSON files as it goes. The pool uses the `spawn` start method (Windows-friendly; avoids inheriting OpenCV/GUI state). Defaults are picked by `default_experiment_workers()` — `cpu_count - 1`, capped at `_DEFAULT_EXPERIMENT_WORKER_CAP = 8`. Pass `--workers 1` to force serial execution for debugging.
+   - **Per-attempt pipeline.** `_execute_pipeline(...)` runs the seven stages above with a concrete `mask_mode ∈ {"no_mask", "mask"}` and returns one `(PairResult, metrics)` tuple. It never sees the user-facing `"both"` value.
+   - **Public entrypoint `run_single_pair`** dispatches based on `config.mask_mode`:
+     - `"no_mask"` or `"mask"` → list of 1 `(result, metrics)` tuple.
+     - `"both"` → list of 2 tuples, `no_mask` first then `mask`. Both attempts are run unconditionally — no early exit on first success.
+   - **Why `"both"` instead of fallback?** Any "try X first, fall back to Y" policy can be derived post-hoc from the paired columns produced by `"both"`. Running both unconditionally costs one extra pipeline pass per pair but yields a richer dataset: per-attempt accuracy distributions, false-match shares per mask mode, and a free `best_of_both` analysis in reporting (see Outputs section). The main pipeline therefore has no fallback machinery; the only consumer that needs short-circuit fallback semantics is the auto-aligner, which implements them locally (Stage 9).
+   - **Experiment matrix.** `run_experiment_matrix` schedules a Cartesian product of `(pair, detector, descriptor, estimator, mask_mode_spec)` across a `multiprocessing` pool. Each worker handles one image pair, loads the images once, and runs every pending attempt for that pair, writing per-attempt JSON files as it goes. Resume is **per-attempt**: an existing JSON for `(pair, det, desc, est, no_mask)` is reused without rerunning that specific attempt, even if its sibling `_mask.json` is missing.
+   - **Pool details.** Start method is `"spawn"` (Windows-friendly; avoids inheriting OpenCV/GUI state from the parent). Worker count picked by `default_experiment_workers()` — `cpu_count - 1`, capped at `_DEFAULT_EXPERIMENT_WORKER_CAP = 8`. `--workers 1` forces serial execution for debugging.
+   - **CSV row aggregation.** For each `(pair, det, desc, est, mask_mode_spec)`, one CSV row is emitted with paired `no_mask_*` and `with_mask_*` columns (NaN on whichever side wasn't run). See the Outputs section for the full column list.
 
-9. **Ground Truth Annotation** (`annotation_gui.py`)
-   - Provides a standalone Tkinter GUI allowing manual alignment and corner-picking to establish ground-truth homographies.
-   - Background auto-alignment runs in a `multiprocessing.Pool` while the user reviews. Worker count defaults via `auto_aligner.default_auto_align_workers()` — `cpu_count - 1`, capped at `_DEFAULT_AUTO_ALIGN_WORKER_CAP = 6`.
+9. **Ground Truth Annotation** (`annotation_gui.py`, `auto_aligner.py`)
+   - Standalone Tkinter GUI for manually aligning each pair and saving a `GroundTruth` JSON.
+   - **Background auto-alignment.** `AutoAligner` runs in a `multiprocessing.Pool` while the annotator reviews. Worker count from `default_auto_align_workers()` — `cpu_count - 1`, capped at `_DEFAULT_AUTO_ALIGN_WORKER_CAP = 6`.
+   - **Self-contained fallback.** The auto-aligner needs a fast best-effort alignment, not the full both-attempts dataset that the experiment runner wants. It therefore implements its own `_try_with_fallback(cfg_template)` helper that calls `run_single_pair` with `mask_mode = "no_mask"` first and `"mask"` only if the first attempt produced no transform. This is the only place in the codebase that has fallback semantics — by design, so the main pipeline stays simple.
 
 ---
 
@@ -148,72 +156,134 @@ All components utilize a single centralized configuration object `RunConfig` def
 ```python
 @dataclass
 class RunConfig:
-    # Mask mode
-    mask_mode: str = "fallback"  # "no_mask" | "mask" | "fallback"
+    # Mask scheduling
+    mask_mode: str = "both"        # "no_mask" | "mask" | "both"
     rgb_gray_threshold: int = 15
     overlap_band_fraction: float = 0.20
 
     # Detector
-    detector: str = "SIFT"  # see DETECTOR_NAMES below
-    detector_params: dict = field(default_factory=dict)  # detector-specific overrides
+    detector: str = "SIFT"
+    detector_params: dict = field(default_factory=dict)
     max_keypoints: int = 5000
 
     # Descriptor
-    descriptor: str = "SIFT"  # see DESCRIPTOR_NAMES below
+    descriptor: str = "SIFT"
     descriptor_params: dict = field(default_factory=dict)
+    descriptor_default_sigma: float = 6.0
 
     # Matching
-    matcher_filter: str = "mnn_nndr"  # "mnn" | "mnn_nndr"
-    nndr_threshold: float = 0.90  # Lowe ratio threshold
+    matcher_filter: str = "mnn_nndr"
+    nndr_threshold: float = 0.90
 
     # Verification
-    estimator: str = "PROSAC"  # "PROSAC" | "USAC_MAGSAC"
+    estimator: str = "PROSAC"      # "PROSAC" | "USAC_MAGSAC"
     ransac_threshold_px: float = 5.0
     ransac_max_iters: int = 10000
     ransac_confidence: float = 0.99
 
-    # Fallback logic
-    fallback_min_inliers: int = 8
+    # Acceptance / categorisation
+    min_inliers: int = 8                              # affine acceptance gate
+    accuracy_tiers_px: tuple[float, ...] = (3.0, 5.0, 10.0)  # tier thresholds for result_label
 
-    # Quality gates (applied after metrics, when GT is available)
-    iou_threshold: float = 0.90               # mAA / quality_flag pass requires iou ≥ this
-    rms_error_threshold_px: float = 10.0      # mAA / quality_flag pass requires rms ≤ this
-
-    # Output
+    # I/O
     output_dir: Path = Path("./results")
     save_intermediate: bool = False
     random_seed: int = 42
 ```
 
-`VALID_MASK_MODES` (`{"no_mask", "mask", "fallback"}`) and `VALID_ESTIMATORS` (`{"PROSAC", "USAC_MAGSAC"}`) live alongside `DETECTOR_NAMES` / `DESCRIPTOR_NAMES` in `config.py`. CLI entrypoints validate against these sets so unknown strings fail upfront.
+`VALID_MASK_MODES = {"no_mask", "mask", "both"}` and `VALID_ESTIMATORS = {"PROSAC", "USAC_MAGSAC"}` live alongside `DETECTOR_NAMES` / `DESCRIPTOR_NAMES` in `config.py`. CLI entrypoints validate against these sets so unknown strings fail upfront.
 
 ---
 
-## Reporting and Metrics
+## Experiment Outputs
 
-The reporting stage reads `aggregate_results.csv` and emits both visualisations and a markdown summary into the output directory.
+An experiment writes three kinds of artefact into `output_dir`. Knowing **what** each one contains and **why** makes it easier to consume them programmatically without reading the code.
 
-### mAA — mean Average Accuracy
+### 1. Per-attempt JSON files
 
-A run is considered a **pass** when its `quality_flag` is `"true"` or `"true after false"` (i.e. all of: affine sanity, inlier count, IoU ≥ threshold, corner RMS ≤ threshold). **mAA** is the per-configuration mean of this pass indicator across pairs — a single scalar in `[0, 1]` summarising end-to-end accuracy with both the geometric and accuracy-gate criteria baked in. Older CSVs that predate the `quality_flag` column fall back to `estimation_succeeded` so historical reports remain readable.
+```
+{pair_id}_{detector}_{descriptor}_{estimator}_{no_mask|mask}.json
+```
 
-### IoU
+One file per `(pair, det, desc, est, attempt_mode)`. The filename's last segment is always the **concrete** mask mode that ran — never `"both"`. When `mask_mode = "both"`, a pair contributes two files (`..._no_mask.json` and `..._mask.json`).
 
-The per-pair IoU between the predicted and ground-truth overlap polygons (in image-A coordinates) is computed in `metrics.overlap_iou`. Reports include median IoU per configuration and a box-plot per detector+descriptor.
+Top-level shape: `{"result": {...PairResult fields...}, "metrics": {...}}`.
 
-### Per-configuration scoreboard
+**Why store raw measurements (not the categorical label)?** Because the categorical depends on `accuracy_tiers_px`. Keeping raw `iou`, `mean_corner_error`, and `corner_error_{0..3}` in the JSON means changing the tier set between report generations requires **zero pipeline reruns** — the CSV is rebuilt from the JSONs with the new tiers applied.
 
-`write_summary_report` emits a combined table sorted by mAA (desc) then median RMS (asc), with columns: `mAA | Median IoU | Median RMS (px)`. Configurations whose `quality_flag` distribution skews towards `"true after false"` are still counted as passing — the fallback path is a legitimate success route.
+Per-file contents:
 
-### Plots written
+| Block        | Field                       | Type / units            | Why we keep it |
+|--------------|-----------------------------|--------------------------|----------------|
+| `result`     | `image_a_path`, `image_b_path` | str (filesystem path) | Provenance |
+|              | `detector`, `descriptor`, `estimator`, `mask_mode` | str  | Config snapshot |
+|              | `n_kp_a`, `n_kp_b`          | int                      | Per-image keypoint counts (post-mask, pre-description) |
+|              | `n_raw_matches`             | int                      | Tentative matches before RANSAC |
+|              | `n_inliers`                 | int                      | Affine-supporting matches |
+|              | `affine_matrix`             | list (2×3 float)         | Estimated transform, A → B. `None` on failure |
+|              | `inlier_mask`               | list (bool)              | Match-level inlier indicator |
+|              | `overlap_polygon_a`, `overlap_polygon_b` | list (N×2 float) | Computed overlap region in each frame |
+|              | `time_{detection,description,matching,verification,geometry}_s` | float | Per-stage wall-clock |
+|              | `time_total_s`              | float                    | End-to-end wall-clock |
+|              | `error_message`             | str \| null              | Human-readable failure reason |
+|              | `result_label`              | str                      | Echoed from metrics (see below) |
+| `metrics`    | `iou`                       | float \| null            | Overlap-polygon IoU vs. GT |
+|              | `mean_corner_error`         | float \| null, px        | Mean Euclidean distance across the four overlap-polygon corners — the canonical HPatches-style accuracy metric |
+|              | `corner_error_{0..3}`       | float \| null, px        | Per-corner errors (useful for debugging lopsided drift) |
+|              | `result_label`              | str                      | Categorical (see Stage 7) |
+|              | `num_keypoints_A/B`, `num_inliers`, `inlier_ratio` | numeric | CSV-friendly aliases of the result counts |
+|              | `*_ms`                      | float, ms                | Per-stage timings in milliseconds |
+|              | `pair_id`, `detector`, `descriptor`, `estimator`, `mask_mode_spec`, `attempt_mode` | str | Identifying fields stamped at write time |
 
-* `maa_barplot.png`           — mAA by configuration
-* `success_rate_heatmap.png`  — mAA heatmap, detector × descriptor
-* `iou_boxplot.png`           — IoU by detector+descriptor
-* `rms_error_boxplot.png`     — RMS corner error by detector+descriptor
-* `inlier_vs_rms_scatter.png` — inlier ratio vs RMS (per pair)
-* `inlier_ratio_barplot.png`  — mean inlier ratio by configuration
-* `runtime_boxplot.png`       — total runtime by configuration
+### 2. Aggregate CSV (`aggregate_results.csv`)
+
+One row per `(pair_id, detector, descriptor, estimator, mask_mode_spec)`. When `mask_mode_spec = "both"`, both column families are populated; otherwise the unrun side is NaN.
+
+Identifying columns:
+
+| Column           | Description |
+|------------------|-------------|
+| `pair_id`        | `"{stem_A}_{stem_B}"` |
+| `detector`, `descriptor`, `estimator` | Config snapshot |
+| `mask_mode`      | The user-requested spec (`"no_mask"`, `"mask"`, or `"both"`). Distinct from the per-attempt `attempt_mode` inside each JSON. |
+
+Per-attempt columns (suffix is the canonical attempt name — `no_mask` or `with_mask`):
+
+| Column                            | Description |
+|-----------------------------------|-------------|
+| `{prefix}_result`                 | Friendly alias of `{prefix}_result_label` — `acc_at_<T>` / `false_match` / `no_match` |
+| `{prefix}_result_label`           | Same value; long name for explicit code paths |
+| `{prefix}_err`                    | Friendly alias of `{prefix}_mean_corner_error` (px) |
+| `{prefix}_mean_corner_error`      | Mean corner reprojection error in pixels |
+| `{prefix}_iou`                    | Overlap-polygon IoU vs. GT |
+| `{prefix}_num_keypoints_A/B`      | Keypoint counts per image |
+| `{prefix}_num_tentative_matches`  | Pre-RANSAC matches |
+| `{prefix}_num_inliers`            | Post-RANSAC inliers |
+| `{prefix}_inlier_ratio`           | `num_inliers / num_tentative_matches` |
+| `{prefix}_{detection,description,matching,verification,geometry,total}_ms` | Per-stage runtimes in milliseconds |
+
+**Why both `*_result` and `*_result_label`** — short alias keeps interactive pandas terse; long name is what the JSON also writes, so code that reads either source can use a single key.
+
+### 3. Markdown summary report (`report.md`, written separately by `scripts/generate_report.py`)
+
+Contents (all derived from the CSV; no per-attempt JSONs needed at this stage):
+
+| Section                 | What it shows | Why |
+|-------------------------|---------------|-----|
+| **Overall**             | Number of CSV rows, the configured `accuracy_tiers_px`, and per-attempt mAA + per-tier acc rates + `false_match` / `no_match` shares | Single-glance sanity check on the whole run |
+| **Per-configuration scoreboard** | One row per `(det, desc, est)` with paired `mAA`, `acc@T`, `false_match`, `no_match` columns for each attempt, plus `mAA<sub>best</sub>` and `acc@T<sub>best</sub>` columns derived from a per-pair "pick the better attempt" policy | Direct comparison of pipelines, with the fallback-vs-single-attempt question answered in-place |
+| **mAA matrices**        | Detector × descriptor table of mAA, one per attempt | Compact pipeline-vs-pipeline view; designed so it can be re-rendered as a heatmap |
+| **Fallback benefit**    | Per-config table of `mAA_best − mAA_no_mask` and `mAA_best − mAA_with_mask` | Quantifies how much running `mask_mode = "both"` would actually buy you over running a single mask attempt — answered post-hoc, no extra runs |
+
+The report is **markdown-only in the current revision**. Heatmap and curve visualisations are intentionally deferred until the report-visualisation design is settled separately.
+
+### Metric definitions (canonical)
+
+- **Mean corner error** — `mean(||p_pred_i − p_gt_i||₂  for i in 0..3)` over the four overlap-polygon corners, in pixels. Matches the HPatches / SuperGlue / LoFTR convention so our numbers are directly comparable to published tables.
+- **IoU** — `intersection_area / union_area` between the predicted and ground-truth overlap polygons in image-A coordinates.
+- **`acc@T`** (per attempt, per config) — fraction of rows whose `result_label` is some `"acc_at_<t>"` with `t ≤ T`. Cumulative: hitting a tighter tier implies clearing every looser one.
+- **mAA** — mean over the configured `accuracy_tiers_px` of the per-tier `acc@T` rate. Equivalently: for each pair, count how many tiers it cleared and divide by the tier count; average across pairs. A pipeline that consistently lands at 2 px (clears all tiers) scores 1.00; one that consistently lands at 11 px (clears no tier) scores 0.00.
+- **`best_of_both`** — per-pair pick of the better attempt by tier rank (smaller-tier label > larger-tier label > `false_match` > `no_match`). Used to compute the fallback-benefit lift; **not** something the pipeline can produce online — it's a post-hoc analysis on the paired columns.
 
 All markdown / JSON I/O is UTF-8.
 

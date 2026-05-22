@@ -13,7 +13,7 @@ def _format_tier(t: float) -> str:
 
 def categorize_result(
     has_transform: bool,
-    rms_corner_error: float | None,
+    mean_corner_error: float | None,
     accuracy_tiers_px: tuple[float, ...] | list[float],
 ) -> str:
     """Map an attempt's outcome to its ordinal accuracy label.
@@ -23,9 +23,9 @@ def categorize_result(
     has_transform
         Whether the pipeline produced an accepted affine matrix (i.e. it
         survived the affine sanity check and the min-inliers gate).
-    rms_corner_error
-        Corner RMS error vs. ground truth, in pixels.  Must be supplied when
-        ``has_transform`` is ``True``; ignored otherwise.
+    mean_corner_error
+        Mean corner reprojection error vs. ground truth, in pixels.  Must be
+        supplied when ``has_transform`` is ``True``; ignored otherwise.
     accuracy_tiers_px
         Tier thresholds; will be sorted ascending.
 
@@ -36,13 +36,13 @@ def categorize_result(
     """
     if not has_transform:
         return "no_match"
-    if rms_corner_error is None or not np.isfinite(rms_corner_error):
-        # Pipeline produced a transform but we have no GT-derived RMS to
+    if mean_corner_error is None or not np.isfinite(mean_corner_error):
+        # Pipeline produced a transform but we have no GT-derived error to
         # grade it against — treat as no_match to keep counts honest.  Real
         # experiments are always run with ground truth (see project_overview).
         return "no_match"
     for t in sorted(accuracy_tiers_px):
-        if rms_corner_error <= t:
+        if mean_corner_error <= t:
             return f"acc_at_{_format_tier(t)}"
     return "false_match"
 
@@ -61,11 +61,18 @@ def per_corner_errors(
     return np.linalg.norm(predicted_corners - ground_truth_corners, axis=1)
 
 
-def overlap_rms_error(corner_errors: np.ndarray) -> float:
-    """RMS of per-corner errors. Single scalar in pixels."""
+def mean_corner_error(corner_errors: np.ndarray) -> float:
+    """Mean of per-corner reprojection errors, in pixels.
+
+    This is the canonical error metric used by HPatches / SuperGlue / LoFTR
+    homography evaluation.  It treats all four corners equally and gives
+    numbers directly comparable to published tables.
+
+    Returns ``nan`` if any input is ``nan``.
+    """
     if np.any(np.isnan(corner_errors)):
         return float('nan')
-    return float(np.sqrt(np.mean(corner_errors**2)))
+    return float(np.mean(corner_errors))
 
 
 def overlap_iou(
@@ -98,7 +105,11 @@ def compute_pair_metrics(
 ) -> dict:
     """Compute all metrics for a single pair result.  Returns a flat dict
     suitable for CSV writing.  Also assigns ``result.result_label`` based on
-    the configured ``accuracy_tiers_px`` and the measured corner RMS error.
+    the configured ``accuracy_tiers_px`` and the measured mean corner error.
+
+    The error metric is **mean corner reprojection error** (the average of
+    the four corner Euclidean distances), matching the HPatches / SuperGlue
+    / LoFTR convention.  See ``project_overview.md`` §Reporting.
     """
     inlier_ratio = result.n_inliers / result.n_raw_matches if result.n_raw_matches > 0 else 0.0
 
@@ -118,7 +129,7 @@ def compute_pair_metrics(
         "corner_error_1": None,
         "corner_error_2": None,
         "corner_error_3": None,
-        "rms_corner_error": None,
+        "mean_corner_error": None,
         "iou": None,
         "result_label": "no_match",
     }
@@ -134,13 +145,13 @@ def compute_pair_metrics(
             if not np.any(np.isnan(errors)):
                 for i, e in enumerate(errors):
                     metrics[f"corner_error_{i}"] = float(e)
-                metrics["rms_corner_error"] = overlap_rms_error(errors)
+                metrics["mean_corner_error"] = mean_corner_error(errors)
             metrics["iou"] = overlap_iou(result.overlap_polygon_a, gt_poly_A)
 
     has_transform = result.affine_matrix is not None
     label = categorize_result(
         has_transform=has_transform,
-        rms_corner_error=metrics["rms_corner_error"],
+        mean_corner_error=metrics["mean_corner_error"],
         accuracy_tiers_px=accuracy_tiers_px,
     )
     metrics["result_label"] = label
