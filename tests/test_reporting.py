@@ -25,7 +25,7 @@ def test_reporting_flow(tmp_path):
         "estimator": "PROSAC",
         "mask_mode": "no_mask",
         "result_label": "acc_at_5",
-        "rms_corner_error": 4.2,
+        "mean_corner_error": 4.2,
         "iou": 0.93,
         "inlier_ratio": 0.5,
         "total_ms": 100.0,
@@ -42,7 +42,7 @@ def test_reporting_flow(tmp_path):
             "detector": "FAST", "descriptor": "BRIEF",
             "estimator": "PROSAC", "mask_mode": "both",
             "no_mask_result": "acc_at_5",   "with_mask_result": "acc_at_3",
-            "no_mask_rms": 4.2,             "with_mask_rms": 2.1,
+            "no_mask_err": 4.2,             "with_mask_err": 2.1,
             "no_mask_iou": 0.93,            "with_mask_iou": 0.97,
         },
         {
@@ -50,7 +50,7 @@ def test_reporting_flow(tmp_path):
             "detector": "FAST", "descriptor": "BRIEF",
             "estimator": "PROSAC", "mask_mode": "both",
             "no_mask_result": "false_match", "with_mask_result": "acc_at_10",
-            "no_mask_rms": 14.0,             "with_mask_rms": 8.5,
+            "no_mask_err": 14.0,             "with_mask_err": 8.5,
             "no_mask_iou": 0.5,              "with_mask_iou": 0.85,
         },
         {
@@ -58,7 +58,7 @@ def test_reporting_flow(tmp_path):
             "detector": "FAST", "descriptor": "BRIEF",
             "estimator": "PROSAC", "mask_mode": "both",
             "no_mask_result": "no_match",   "with_mask_result": "acc_at_5",
-            "no_mask_rms": None,            "with_mask_rms": 4.0,
+            "no_mask_err": None,            "with_mask_err": 4.0,
         },
     ]
     csv_path = tmp_path / "aggregate.csv"

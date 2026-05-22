@@ -13,9 +13,10 @@ from .verification import verify_affine
 from .geometry import compute_overlap_polygon, apply_affine, invert_affine
 from .metrics import (
     per_corner_errors,
-    overlap_rms_error,
+    mean_corner_error,
     overlap_iou,
     compute_pair_metrics,
+    categorize_result,
 )
 from .reporting import write_pair_json, write_aggregate_csv, write_summary_report
 from .orchestrator import run_single_pair, run_experiment_matrix, build_full_matrix
@@ -54,9 +55,10 @@ __all__ = [
     "invert_affine",
     # metrics
     "per_corner_errors",
-    "overlap_rms_error",
+    "mean_corner_error",
     "overlap_iou",
     "compute_pair_metrics",
+    "categorize_result",
     # reporting
     "write_pair_json",
     "write_aggregate_csv",

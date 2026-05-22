@@ -334,7 +334,7 @@ _ATTEMPT_COLUMN_PREFIX = {"no_mask": "no_mask", "mask": "with_mask"}
 
 # Per-attempt stat keys that get suffixed and merged into the CSV row.
 _ATTEMPT_STAT_KEYS = (
-    "result_label", "iou", "rms_corner_error",
+    "result_label", "iou", "mean_corner_error",
     "num_keypoints_A", "num_keypoints_B",
     "num_tentative_matches", "num_inliers", "inlier_ratio",
     "detection_ms", "description_ms", "matching_ms",
@@ -353,8 +353,8 @@ def _attempt_row_fragment(attempt_mode: str, metrics: dict) -> dict:
     # Friendly aliases for the most-used columns (saves a join in pandas).
     if "result_label" in metrics:
         out[f"{prefix}_result"] = metrics["result_label"]
-    if "rms_corner_error" in metrics:
-        out[f"{prefix}_rms"] = metrics["rms_corner_error"]
+    if "mean_corner_error" in metrics:
+        out[f"{prefix}_err"] = metrics["mean_corner_error"]
     return out
 
 
