@@ -266,16 +266,24 @@ Per-attempt columns (suffix is the canonical attempt name — `no_mask` or `with
 
 ### 3. Markdown summary report (`report.md`, written separately by `scripts/generate_report.py`)
 
-Contents (all derived from the CSV; no per-attempt JSONs needed at this stage):
+Every section is split by **estimator** (`PROSAC`, `USAC_MAGSAC`) and by **mask attempt** (`no_mask`, `with_mask`, `best_of_both`), because the two estimators behave categorically differently enough that pooling them obscures the picture, and each attempt answers a different operational question.
 
-| Section                 | What it shows | Why |
-|-------------------------|---------------|-----|
-| **Overall**             | Number of CSV rows, the configured `accuracy_tiers_px`, and per-attempt mAA + per-tier acc rates + `false_match` / `no_match` shares | Single-glance sanity check on the whole run |
-| **Per-configuration scoreboard** | One row per `(det, desc, est)` with paired `mAA`, `acc@T`, `false_match`, `no_match` columns for each attempt, plus `mAA<sub>best</sub>` and `acc@T<sub>best</sub>` columns derived from a per-pair "pick the better attempt" policy | Direct comparison of pipelines, with the fallback-vs-single-attempt question answered in-place |
-| **mAA matrices**        | Detector × descriptor table of mAA, one per attempt | Compact pipeline-vs-pipeline view; designed so it can be re-rendered as a heatmap |
-| **Fallback benefit**    | Per-config table of `mAA_best − mAA_no_mask` and `mAA_best − mAA_with_mask` | Quantifies how much running `mask_mode = "both"` would actually buy you over running a single mask attempt — answered post-hoc, no extra runs |
+`best_of_both` is a derived per-row label: for each pair, the report builder picks whichever single attempt landed in the better tier (`acc_at_3 > acc_at_5 > acc_at_10 > false_match > no_match`). It's only populated for rows where `mask_mode_spec = "both"`. From that point on it's treated identically to the other two attempts — it appears in every overall, scoreboard, matrix, and benefit table.
 
-The report is **markdown-only in the current revision**. Heatmap and curve visualisations are intentionally deferred until the report-visualisation design is settled separately.
+| Section                 | Granularity | What it shows | Why |
+|-------------------------|-------------|---------------|-----|
+| **Overall**             | One row per `(estimator × attempt)` = up to 6 rows | Headline mAA, **Precision**, per-tier `acc@T`, `false_match` / `no_match` shares | Single-glance summary of the whole experiment with the two key axes already separated |
+| **Per-configuration scoreboard** | One table per estimator; rows are `(detector + descriptor)` | All three attempts side-by-side with mAA, Precision, per-tier rates, false/no_match shares | Comparing pipelines within an estimator, with the fallback-vs-single-attempt question answered in-place |
+| **mAA matrices (detector × descriptor)** | One **heatmap PNG + numeric table** per `(estimator × attempt)` = up to 6 of each | mAA across the full detector/descriptor grid | Compact pipeline-vs-pipeline view that survives an 11×9 sweep cleanly. Rows and columns sorted by descending mean mAA so the strongest configurations sit top-left. Colour scale: **blue → white → red** (matplotlib `bwr`) |
+| **Precision matrices**  | Same layout as mAA matrices                       | Per-emission correctness rate                                                                          | Catches the failure mode mAA can hide: a pipeline that emits confident-but-wrong transforms (high `false_match`) scores low here even when mAA looks decent. Colour scale: **green → white → red** (custom diverging palette) |
+| **Fallback benefit** | One table per estimator; rows are `(detector + descriptor)` | `mAA_best − mAA_no_mask` and `mAA_best − mAA_with_mask` lift columns | Quantifies how much running `mask_mode = "both"` would actually buy you over a single mask attempt — answered post-hoc, no extra runs needed |
+
+Heatmap PNG filenames: `heatmap_{maa|precision}_{estimator}_{attempt}.png`, written alongside `report.md`. The numeric table beneath each PNG uses the same row/column ordering, so visual scan and precise lookup stay aligned.
+
+### Metric definitions added in this section
+
+- **Precision** = `(emitted ∧ not false_match) / emitted`, where `emitted = (label != "no_match")`. Equivalently `1 − false_match / (1 − no_match)`. Answers: *when the pipeline does emit a transform, how often is it at least within the loosest configured tier (default 10 px)?* Undefined (NaN) for slices where every attempt was `no_match`.
+- This complements mAA rather than replacing it: mAA conflates `false_match` and `no_match` (both score 0), Precision distinguishes "wrong" from "abstained". A high-mAA / low-Precision pipeline is dangerous — it lands accurately most of the time but emits confidently-wrong answers in the failure cases.
 
 ### Metric definitions (canonical)
 
