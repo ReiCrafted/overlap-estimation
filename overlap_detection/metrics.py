@@ -22,7 +22,7 @@ def categorize_result(
     ----------
     has_transform
         Whether the pipeline produced an accepted affine matrix (i.e. it
-        survived the affine sanity check and the min-inliers gate).
+        survived the min-inliers gate).
     mean_corner_error
         Mean corner reprojection error vs. ground truth, in pixels.  Must be
         supplied when ``has_transform`` is ``True``; ignored otherwise.

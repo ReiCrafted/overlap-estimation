@@ -28,15 +28,15 @@ python scripts/generate_report.py --results-dir results/my_run --output-dir repo
 
 ```
 preprocess (mask) → detect → describe → match → verify (RANSAC) →
-    affine sanity check → overlap geometry → metrics →
+    min-inliers gate → overlap geometry → metrics →
     result_label ∈ {acc_at_<T>, false_match, no_match}
 ```
 
 11 detectors, 9 descriptors, every pairing is valid (custom NumPy fallbacks
 for LIOP and MLDB make this work). Robust verification via PROSAC or
-USAC_MAGSAC. Geometric verification is followed by a scale/rotation sanity
-filter; metrics produce an ordinal `result_label` per the configured
-accuracy tiers, plus IoU and the standard AUC-form mAA in reporting.
+USAC_MAGSAC, gated only by `RunConfig.min_inliers`; metrics produce an
+ordinal `result_label` per the configured accuracy tiers, plus IoU and the
+standard AUC-form mAA in reporting.
 
 For full architecture, data contracts, custom descriptor algorithms, and
 the quality-gate semantics see [project_overview.md](project_overview.md).

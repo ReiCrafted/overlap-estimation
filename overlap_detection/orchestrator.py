@@ -11,7 +11,6 @@ attempt still produces its own JSON file.
 """
 
 import json
-import math
 import os
 import time
 import cv2
@@ -45,28 +44,6 @@ def default_experiment_workers() -> int:
     """Pick a worker count for ``run_experiment_matrix``: ``cpu_count - 1``
     capped at ``_DEFAULT_EXPERIMENT_WORKER_CAP`` and floored at 1."""
     return max(1, min((os.cpu_count() or 1) - 1, _DEFAULT_EXPERIMENT_WORKER_CAP))
-
-
-# ---------------------------------------------------------------------------
-# Affine sanity filter
-# ---------------------------------------------------------------------------
-_MAX_SCALE_DIFF = 0.10   # reject if |scale - 1| > 10 %
-_MAX_ROTATION_DEG = 3.0  # reject if |rotation| > 3 °
-
-
-def _affine_is_sane(affine_mat: np.ndarray) -> tuple[bool, float, float]:
-    """Check scale and rotation of a 2×3 affine matrix.
-
-    Returns (is_sane, scale, rotation_deg).  Scale is the column-0 norm of
-    the 2×2 sub-matrix; rotation is ``atan2(a10, a00)``.  A pure translation
-    has scale=1.0, rotation=0.0.
-    """
-    a00, a10 = float(affine_mat[0, 0]), float(affine_mat[1, 0])
-    scale = math.sqrt(a00 ** 2 + a10 ** 2)
-    rotation_deg = math.degrees(math.atan2(a10, a00))
-    is_sane = (abs(scale - 1.0) <= _MAX_SCALE_DIFF and
-               abs(rotation_deg) <= _MAX_ROTATION_DEG)
-    return is_sane, scale, rotation_deg
 
 
 def _parse_coords(path: Path) -> tuple[int, int]:
@@ -212,23 +189,16 @@ def _execute_pipeline(
                                 f"Too few inliers ({result.n_inliers} "
                                 f"< {config.min_inliers})")
                         else:
-                            sane, scale, rot_deg = _affine_is_sane(affine_mat)
-                            if not sane:
-                                result.error_message = (
-                                    f"Affine rejected: scale={scale:.3f} "
-                                    f"(diff={abs(scale-1)*100:.1f}%), "
-                                    f"rotation={rot_deg:.2f}°")
-                            else:
-                                result.affine_matrix = affine_mat
-                                result.inlier_mask = inliers
+                            result.affine_matrix = affine_mat
+                            result.inlier_mask = inliers
 
-                                # 6. Geometry
-                                t0 = time.perf_counter()
-                                poly_A, poly_B = compute_overlap_polygon(
-                                    affine_mat, image_A.shape, image_B.shape)
-                                result.time_geometry_s = time.perf_counter() - t0
-                                result.overlap_polygon_a = poly_A
-                                result.overlap_polygon_b = poly_B
+                            # 6. Geometry
+                            t0 = time.perf_counter()
+                            poly_A, poly_B = compute_overlap_polygon(
+                                affine_mat, image_A.shape, image_B.shape)
+                            result.time_geometry_s = time.perf_counter() - t0
+                            result.overlap_polygon_a = poly_A
+                            result.overlap_polygon_b = poly_B
 
     except Exception as e:
         result.error_message = f"Exception: {str(e)}"
