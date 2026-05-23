@@ -2,7 +2,7 @@ import numpy as np
 from pathlib import Path
 from shapely.geometry import Polygon
 from overlap_detection.types import PairResult, GroundTruth
-from overlap_detection.geometry import compute_overlap_polygon
+from overlap_detection.geometry import compute_overlap_polygon, apply_affine
 
 
 def _format_tier(t: float) -> str:
@@ -48,29 +48,55 @@ def categorize_result(
 
 
 def per_corner_errors(
-    predicted_corners: np.ndarray,   # Nx2 from compute_overlap_polygon
-    ground_truth_corners: np.ndarray, # Nx2 from manual annotation
+    predicted_corners: np.ndarray,   # Nx2
+    ground_truth_corners: np.ndarray, # Nx2
 ) -> np.ndarray:
-    """Returns N-element array of Euclidean distances per corner, in pixels.
-    Assumes corners are in matching order (use polygon vertex matching
-    if order is ambiguous — for axis-aligned rectangles, top-left
-    should be first in both)."""
+    """Generic pairwise Euclidean distance between two ordered point sets.
+
+    Returns an ``N``-element array of distances.  If the input lengths
+    disagree, returns ``np.nan`` for every entry (callers downstream treat
+    NaN errors as ungradable).
+    """
     if len(predicted_corners) != len(ground_truth_corners):
         return np.full((len(ground_truth_corners),), np.nan)
 
     return np.linalg.norm(predicted_corners - ground_truth_corners, axis=1)
 
 
+def corner_errors_hpatches(
+    estimated_affine: np.ndarray,    # 2x3, A→B
+    gt_affine: np.ndarray,           # 2x3, A→B
+    image_a_shape: tuple,            # (H, W, …)
+) -> np.ndarray:
+    """HPatches / SuperGlue convention corner error.
+
+    Warps image-A's four image-rectangle corners through both the estimated
+    and the ground-truth affine; returns the four Euclidean distances (in
+    **B-pixels**) between the two sets of projected corners.
+
+    Returned array is always shape ``(4,)`` in the order
+    ``[top-left, top-right, bottom-right, bottom-left]`` — the same order
+    in which A's corners are constructed below.  No clipping is performed;
+    projected corners may legitimately land outside B's image rectangle.
+    """
+    H_A, W_A = image_a_shape[:2]
+    A_corners = np.array(
+        [[0, 0], [W_A, 0], [W_A, H_A], [0, H_A]], dtype=np.float64,
+    )
+    pred = apply_affine(A_corners, estimated_affine)
+    gt = apply_affine(A_corners, gt_affine)
+    return np.linalg.norm(pred - gt, axis=1)
+
+
 def mean_corner_error(corner_errors: np.ndarray) -> float:
     """Mean of per-corner reprojection errors, in pixels.
 
-    This is the canonical error metric used by HPatches / SuperGlue / LoFTR
-    homography evaluation.  It treats all four corners equally and gives
-    numbers directly comparable to published tables.
-
-    Returns ``nan`` if any input is ``nan``.
+    Returns ``nan`` if any input is ``nan``.  The canonical input is the
+    output of :func:`corner_errors_hpatches`, matching the SuperGlue /
+    glue-factory / LoFTR convention so the numbers are directly comparable
+    to published tables.
     """
-    if np.any(np.isnan(corner_errors)):
+    if len(corner_errors) == 0 or np.any(np.isnan(corner_errors)):
         return float('nan')
     return float(np.mean(corner_errors))
 
@@ -107,9 +133,18 @@ def compute_pair_metrics(
     suitable for CSV writing.  Also assigns ``result.result_label`` based on
     the configured ``accuracy_tiers_px`` and the measured mean corner error.
 
-    The error metric is **mean corner reprojection error** (the average of
-    the four corner Euclidean distances), matching the HPatches / SuperGlue
-    / LoFTR convention.  See ``project_overview.md`` §Reporting.
+    Two related geometric measurements are taken, each from a different
+    polygon:
+
+    * **Corner error** uses :func:`corner_errors_hpatches` — image-A's four
+      image-rectangle corners projected through both the estimated and
+      ground-truth affines, measured in B-pixels with no clipping.  Always
+      4 corners; reported as ``corner_error_{0..3}`` in the order
+      ``TL, TR, BR, BL`` and aggregated as ``mean_corner_error``.  This
+      matches the HPatches / SuperGlue / LoFTR convention.
+    * **IoU** uses the clipped overlap polygon (``result.overlap_polygon_a``
+      vs. a freshly-computed GT overlap polygon), since IoU is fundamentally
+      an area metric and needs the actual overlap region.
     """
     inlier_ratio = result.n_inliers / result.n_raw_matches if result.n_raw_matches > 0 else 0.0
 
@@ -125,32 +160,41 @@ def compute_pair_metrics(
         "verification_ms": result.time_verification_s * 1000,
         "geometry_ms": result.time_geometry_s * 1000,
         "total_ms": result.time_total_s * 1000,
-        "corner_error_0": None,
-        "corner_error_1": None,
-        "corner_error_2": None,
-        "corner_error_3": None,
+        "corner_error_0": None,   # TL
+        "corner_error_1": None,   # TR
+        "corner_error_2": None,   # BR
+        "corner_error_3": None,   # BL
         "mean_corner_error": None,
         "iou": None,
         "result_label": "no_match",
     }
 
-    if ground_truth is not None and result.overlap_polygon_a is not None and len(result.overlap_polygon_a) > 0:
+    has_gt = ground_truth is not None
+    has_affine = result.affine_matrix is not None
+
+    # Corner error (HPatches convention) — needs both affines, no polygons.
+    if has_gt and has_affine:
+        errors = corner_errors_hpatches(
+            result.affine_matrix,
+            ground_truth.affine_matrix_A_to_B,
+            ground_truth.image_a_shape,
+        )
+        for i, e in enumerate(errors):
+            metrics[f"corner_error_{i}"] = float(e)
+        metrics["mean_corner_error"] = mean_corner_error(errors)
+
+    # IoU — uses the clipped overlap polygons in A's frame.
+    if has_gt and result.overlap_polygon_a is not None and len(result.overlap_polygon_a) > 0:
         gt_poly_A, _ = compute_overlap_polygon(
             ground_truth.affine_matrix_A_to_B,
             ground_truth.image_a_shape,
             ground_truth.image_b_shape,
         )
         if len(gt_poly_A) > 0:
-            errors = per_corner_errors(result.overlap_polygon_a, gt_poly_A)
-            if not np.any(np.isnan(errors)):
-                for i, e in enumerate(errors):
-                    metrics[f"corner_error_{i}"] = float(e)
-                metrics["mean_corner_error"] = mean_corner_error(errors)
             metrics["iou"] = overlap_iou(result.overlap_polygon_a, gt_poly_A)
 
-    has_transform = result.affine_matrix is not None
     label = categorize_result(
-        has_transform=has_transform,
+        has_transform=has_affine,
         mean_corner_error=metrics["mean_corner_error"],
         accuracy_tiers_px=accuracy_tiers_px,
     )

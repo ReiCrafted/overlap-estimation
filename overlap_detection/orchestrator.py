@@ -358,6 +358,25 @@ def _attempt_row_fragment(attempt_mode: str, metrics: dict) -> dict:
     return out
 
 
+def _worker_init():
+    """Per-worker initialiser.  Disable cv2's internal thread pool and OpenCL
+    so cv2 doesn't deadlock under ``multiprocessing`` on Windows.
+
+    Without this, each worker keeps cv2's TBB/OpenMP threads alive on top of
+    multiprocessing's own process pool, which on Windows can wedge the
+    worker before it ever returns its first result.  We pin each worker to
+    single-threaded cv2 so the only parallelism is at the process level.
+    """
+    try:
+        cv2.setNumThreads(0)
+    except Exception:
+        pass
+    try:
+        cv2.ocl.setUseOpenCL(False)
+    except Exception:
+        pass
+
+
 def _load_cached_metrics(json_path: Path) -> Optional[dict]:
     """Read the ``metrics`` block from a previously-written per-attempt JSON.
     Returns ``None`` if the file is missing or unreadable."""
@@ -492,7 +511,9 @@ def run_experiment_matrix(
                 pbar.update(len(configs))
         else:
             ctx = get_context("spawn")
-            with ctx.Pool(processes=n_workers) as pool:
+            # initializer disables cv2 threading per worker; without it the
+            # pool can deadlock on Windows before any worker returns a result.
+            with ctx.Pool(processes=n_workers, initializer=_worker_init) as pool:
                 for pair_id, rows, error in pool.imap_unordered(
                     _pair_worker, worker_args
                 ):

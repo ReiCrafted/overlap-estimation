@@ -2,7 +2,7 @@ import cv2
 import os
 import numpy as np
 from pathlib import Path
-from multiprocessing import Pool
+from multiprocessing import get_context
 import time
 
 from overlap_detection.config import RunConfig
@@ -78,11 +78,18 @@ def _align_worker(args: tuple[str, str, str]) -> tuple[str, np.ndarray | None]:
 
 
 class AutoAligner:
-    """Manages background auto-alignment of image pairs using multiprocessing."""
+    """Manages background auto-alignment of image pairs using multiprocessing.
+
+    Uses the ``"spawn"`` start method explicitly so workers do not inherit
+    the GUI process's cv2 / Tkinter state.  Matches the orchestrator's choice
+    (see ``run_experiment_matrix``); fork-based pools have caused GUI deadlocks
+    on Linux in similar setups.
+    """
     def __init__(self, workers: int | None = None):
         if workers is None:
             workers = default_auto_align_workers()
-        self.pool = Pool(processes=workers)
+        ctx = get_context("spawn")
+        self.pool = ctx.Pool(processes=workers)
         self.results = {}
         self._async_results = {}
 

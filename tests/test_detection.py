@@ -20,7 +20,8 @@ def _make_checkerboard(size: int = 200, sq: int = 25) -> np.ndarray:
 
 
 @pytest.mark.parametrize("detector_name", [
-    "Harris", "GFTT", "FAST", "AGAST", "BRISK", "SIFT", "KAZE", "AKAZE", "MSER"
+    "Harris", "GFTT", "FAST", "AGAST", "BRISK", "SIFT", "USURF", "STAR",
+    "KAZE", "AKAZE", "MSER",
 ])
 def test_detect_synthetic(detector_name):
     """Each detector should find at least one keypoint on a checkerboard."""

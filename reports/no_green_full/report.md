@@ -1,5 +1,12 @@
 # Overlap Detection Summary Report
 
+> **Note (archival report).** This file predates the current reporting
+> layout (mAA / Precision / acc@T / heatmaps) and uses retired metrics
+> (`median RMS error`, `success rate`). Kept for historical reference only;
+> the current code emits a different report structure. See
+> `reports/no_green_both_prosac_1/report.md` for an example closer to today's
+> format.
+
 Total runs executed: 2970
 
 Overall success rate: 74.88%
@@ -16,7 +23,7 @@ Best configuration by IoU: **MSER+USURF+PROSAC+fallback**
 618 runs had <10% inliers.
 
 
-## Success Rate by Detector × Descriptor
+## Success Rate by Detector ï¿½ Descriptor
 
 | Detector | BRIEF | BRISK | DAISY | LIOP | MLDB | RootSIFT | SIFT | SUFREAK | USURF |
 |---|---|---|---|---|---|---|---|---|---|
