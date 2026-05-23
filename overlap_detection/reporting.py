@@ -8,8 +8,33 @@ Heatmap PNGs render the detector × descriptor matrices visually: one PNG per
 Row/column ordering on every heatmap is by descending **per-axis average** of
 the metric being plotted, so the strongest configurations sit in the top-left.
 Colour scales:
-  * mAA       → blue–white–red  (matplotlib "bwr")
-  * Precision → green–white–red (custom LinearSegmentedColormap)
+  * mAA       → red–white–blue  (matplotlib "bwr_r")
+  * Precision → red–white–green (custom LinearSegmentedColormap)
+
+mAA definition (standard AUC form, matching SuperGlue / glue-factory)
+----------------------------------------------------------------------
+mAA is computed from the per-pair **mean corner error** (``{attempt}_err``
+columns in the CSV), not from the ordinal result labels.
+
+For each configured accuracy tier threshold T (default 3, 5, 10 px):
+
+    AUC@T = (1/T) * ∫₀ᵀ recall(ε) dε
+
+where recall(ε) is the fraction of pairs whose corner error ≤ ε.  The
+integral is evaluated exactly via the trapezoidal rule on the sorted error
+values.  mAA = mean(AUC@T₁, AUC@T₂, …).
+
+Failures (no transform produced → NaN corner error) are mapped to infinite
+error before sorting.  They count in the recall denominator but never reach
+any finite threshold, so each failure reduces the score proportionally.
+This is identical to the glue-factory convention (``error = float("inf")``
+for estimation failures).
+
+Difference from binary-accuracy averaging
+  The standard AUC rewards accuracy *within* each threshold window: a pair
+  with error 0.5 px contributes more than one with error 2.9 px even though
+  both clear a 3 px threshold in a binary sense.  Binary averaging
+  (mean of acc@T₁, acc@T₂, …) loses this within-tier information.
 """
 
 import json
@@ -17,20 +42,30 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Optional
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-from matplotlib.colors import LinearSegmentedColormap
 import numpy as np
 import pandas as pd
 
 from overlap_detection.types import PairResult
 
 
-_PRECISION_CMAP = LinearSegmentedColormap.from_list(
-    "gwr", ["green", "white", "red"],
-)
-_MAA_CMAP = "bwr"   # built-in blue-white-red
+# matplotlib is intentionally NOT imported at module load — it's only needed
+# by the heatmap renderer, and importing it eagerly adds ~1-2 s to every
+# orchestrator worker startup (workers only ever call write_pair_json).
+# The lazy-import helpers below return matplotlib objects on first call.
+
+def _matplotlib_pyplot():
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    return plt
+
+
+def _precision_cmap():
+    from matplotlib.colors import LinearSegmentedColormap
+    return LinearSegmentedColormap.from_list("rwg", ["red", "white", "green"])
+
+
+_MAA_CMAP_NAME = "bwr_r"   # matplotlib built-in: red-white-blue
 
 
 # ---------------------------------------------------------------------------
@@ -122,13 +157,30 @@ def _cumulative_acc_rate(series: pd.Series, threshold: float) -> float:
     return float(cleared_mask.mean()) if len(series) else 0.0
 
 
-def _maa(series: pd.Series, tiers: list[float]) -> float:
-    """Mean Average Accuracy: mean across the configured tiers of the
-    per-tier cumulative pass rate.  Equivalent to averaging, over both
-    pairs and thresholds, the boolean "this pair cleared this threshold"."""
-    if not tiers:
+def _maa(errors: pd.Series, tiers: list[float]) -> float:
+    """Mean Average Accuracy (standard AUC form, matching SuperGlue / glue-factory).
+
+    For each tier threshold T, computes AUC@T — the area under the
+    recall-vs-error curve from 0 to T, normalised by T.  mAA is the mean
+    of these per-threshold AUC values.
+
+    Failures (NaN error — no transform produced) map to infinite error:
+    they count in the recall denominator but never reach any threshold,
+    so each failure reduces the score proportionally.  This is identical
+    to how glue-factory handles estimation failures (error = inf).
+    """
+    if not tiers or errors.empty:
         return float("nan")
-    return float(np.mean([_cumulative_acc_rate(series, t) for t in tiers]))
+    err = errors.fillna(float("inf")).to_numpy(dtype=float)
+    sorted_err = np.r_[0.0, np.sort(err)]
+    recall     = np.r_[0.0, (np.arange(len(err)) + 1) / len(err)]
+    aucs = []
+    for t in tiers:
+        last = int(np.searchsorted(sorted_err, t))
+        e = np.r_[sorted_err[:last], t]
+        r = np.r_[recall[:last],     recall[last - 1]]
+        aucs.append(float(np.trapezoid(r, x=e) / t))
+    return float(np.mean(aucs))
 
 
 def _share(series: pd.Series, value: str) -> float:
@@ -143,7 +195,7 @@ def _best_of_both(no_mask: pd.Series, with_mask: pd.Series) -> pd.Series:
     fallback policy that picks the better of the two attempts achieve?".
     """
     def rank(label) -> tuple[int, float]:
-        if label == "no_match" or label is None or (isinstance(label, float) and np.isnan(label)):
+        if pd.isna(label) or label == "no_match":
             return (3, 0.0)
         if label == "false_match":
             return (2, 0.0)
@@ -195,6 +247,43 @@ def _attempt_col(attempt: str) -> str:
     return f"{attempt}_result"
 
 
+def _error_col(attempt: str) -> str:
+    return f"{attempt}_err"
+
+
+def _add_best_of_both_err_column(df: pd.DataFrame) -> pd.DataFrame:
+    """Add ``best_of_both_err``: the corner error of whichever attempt
+    ``_best_of_both`` selected per row.  Mirrors the label-picking logic so
+    AUC-based mAA for best_of_both uses the same attempt that won the label."""
+    if "best_of_both_err" in df.columns:
+        return df
+    needed = {"no_mask_err", "with_mask_err", "no_mask_result", "with_mask_result"}
+    if not needed.issubset(df.columns):
+        df["best_of_both_err"] = pd.NA
+        return df
+
+    def _rank(label) -> tuple[int, float]:
+        if pd.isna(label) or label == "no_match":
+            return (3, 0.0)
+        if label == "false_match":
+            return (2, 0.0)
+        t = _parse_tier(label)
+        return (1, t) if t is not None else (3, 0.0)
+
+    errs = []
+    for i in range(len(df)):
+        nm_res = df["no_mask_result"].iat[i]
+        wm_res = df["with_mask_result"].iat[i]
+        if pd.isna(nm_res) or pd.isna(wm_res):
+            errs.append(float("nan"))
+        elif _rank(nm_res) <= _rank(wm_res):   # no_mask wins (or tied)
+            errs.append(df["no_mask_err"].iat[i])
+        else:
+            errs.append(df["with_mask_err"].iat[i])
+    df["best_of_both_err"] = errs
+    return df
+
+
 def _precision(series: pd.Series) -> float:
     """Fraction of *emitted* transforms that cleared the loosest accuracy tier.
 
@@ -215,20 +304,22 @@ def _precision(series: pd.Series) -> float:
     return n_correct / n_emitted
 
 
-def _maa_for(series: pd.Series, tiers: list[float]) -> dict:
-    """Convenience: a single attempt's slice → {n, maa, precision, acc@T..., false, no}."""
-    series = series.dropna()
-    if series.empty:
+def _maa_for(label_series: pd.Series, err_series: pd.Series,
+             tiers: list[float]) -> dict:
+    """Convenience: a single attempt's label + error slices → {n, maa, …}."""
+    label_series = label_series.dropna()
+    if label_series.empty:
         return {"n": 0}
+    err_series = err_series.reindex(label_series.index)
     out: dict = {
-        "n": int(len(series)),
-        "maa": _maa(series, tiers),
-        "precision": _precision(series),
-        "false_match": _share(series, "false_match"),
-        "no_match": _share(series, "no_match"),
+        "n": int(len(label_series)),
+        "maa": _maa(err_series, tiers),
+        "precision": _precision(label_series),
+        "false_match": _share(label_series, "false_match"),
+        "no_match": _share(label_series, "no_match"),
     }
     for t in tiers:
-        out[f"acc_at_{t:g}"] = _cumulative_acc_rate(series, t)
+        out[f"acc_at_{t:g}"] = _cumulative_acc_rate(label_series, t)
     return out
 
 
@@ -257,7 +348,9 @@ def _render_overall(df: pd.DataFrame, estimators: list[str],
             col = _attempt_col(attempt)
             if col not in sub.columns:
                 continue
-            stats = _maa_for(sub[col], tiers)
+            ecol = _error_col(attempt)
+            err = sub[ecol] if ecol in sub.columns else pd.Series(dtype=float)
+            stats = _maa_for(sub[col], err, tiers)
             if stats.get("n", 0) == 0:
                 continue
             prec = stats["precision"]
@@ -294,7 +387,9 @@ def _per_config_summary(df: pd.DataFrame, estimator: str,
             col = _attempt_col(attempt)
             if col not in group.columns:
                 continue
-            stats = _maa_for(group[col], tiers)
+            ecol = _error_col(attempt)
+            err = group[ecol] if ecol in group.columns else pd.Series(dtype=float)
+            stats = _maa_for(group[col], err, tiers)
             if stats.get("n", 0) == 0:
                 continue
             rec[f"maa_{attempt}"] = stats["maa"]
@@ -381,15 +476,17 @@ def _metric_matrix(df: pd.DataFrame, estimator: str, attempt: str,
     sub = df[df["estimator"] == estimator]
     if sub.empty:
         return pd.DataFrame()
+    ecol = _error_col(attempt)
     rows = []
     for (det, desc), group in sub.groupby(["detector", "descriptor"], sort=False):
-        series = group[col].dropna()
-        if series.empty:
+        label_s = group[col].dropna()
+        if label_s.empty:
             value = float("nan")
         elif metric == "maa":
-            value = _maa(series, tiers)
+            err_s = group[ecol].reindex(label_s.index) if ecol in group.columns else pd.Series(dtype=float)
+            value = _maa(err_s, tiers)
         elif metric == "precision":
-            value = _precision(series)
+            value = _precision(label_s)
         else:
             raise ValueError(f"Unknown metric: {metric!r}")
         rows.append({"detector": det, "descriptor": desc, "value": value})
@@ -430,6 +527,7 @@ def _save_heatmap(table: pd.DataFrame, path: Path, *, title: str,
     """
     if table.empty:
         return
+    plt = _matplotlib_pyplot()
     n_rows, n_cols = table.shape
     fig, ax = plt.subplots(
         figsize=(max(6, n_cols * 0.95 + 1.5), max(4, n_rows * 0.55 + 1.0))
@@ -456,11 +554,38 @@ def _save_heatmap(table: pd.DataFrame, path: Path, *, title: str,
     ax.set_ylabel("Detector")
     fig.tight_layout()
     fig.savefig(path, dpi=120, bbox_inches="tight")
-    plt.close(fig)
+    _matplotlib_pyplot().close(fig)
 
 
 def _heatmap_filename(metric: str, estimator: str, attempt: str) -> str:
     return f"heatmap_{metric}_{estimator}_{attempt}.png"
+
+
+def _section_vmax(tables: list[pd.DataFrame], metric: str) -> float:
+    """Pick a single ``vmax`` for every heatmap in one section so they stay
+    visually comparable.
+
+    * Precision: always ``1.0`` — the metric is bounded in ``[0, 1]`` and
+      typically saturates near the top.
+    * mAA (AUC form): use the observed max across all tables, rounded up to
+      the next 0.1 and floored at ``0.3``.  Floor prevents three near-zero
+      tables from amplifying noise; rounding keeps the colorbar tidy.
+      NaN cells (sparse tables) are ignored — without nan-aware reduction
+      one missing combo would collapse the whole table's max to NaN and the
+      shared scale to the 0.3 floor.
+    """
+    if metric != "maa":
+        return 1.0
+    observed = 0.0
+    for t in tables:
+        if t.empty:
+            continue
+        arr = t.to_numpy(dtype=float, na_value=np.nan)
+        finite = arr[np.isfinite(arr)]
+        if finite.size:
+            observed = max(observed, float(finite.max()))
+    rounded = float(np.ceil(observed * 10.0) / 10.0)
+    return float(min(1.0, max(0.3, rounded)))
 
 
 def _render_matrices_section(df: pd.DataFrame, estimators: list[str],
@@ -472,51 +597,61 @@ def _render_matrices_section(df: pd.DataFrame, estimators: list[str],
     emits markdown that embeds each PNG followed by the same data as a table
     (table uses the same row/column ordering, so the heatmap and the lookup
     table line up cell-for-cell).
+
+    All heatmaps in the section share a single colour scale (see
+    :func:`_section_vmax`) so the eye can compare cells across the grid.
     """
     pretty_metric = "mAA" if metric == "maa" else "Precision"
-    cmap = _MAA_CMAP if metric == "maa" else _PRECISION_CMAP
+    cmap = _MAA_CMAP_NAME if metric == "maa" else _precision_cmap()
+
+    # Pass 1: collect all the ordered tables so we can pick a shared vmax.
+    populated: list[tuple[str, str, pd.DataFrame]] = []
+    for est in estimators:
+        for attempt in _ATTEMPTS:
+            table = _metric_matrix(df, est, attempt, metric, tiers)
+            if table.empty or table.isna().all().all():
+                continue
+            populated.append((est, attempt, _order_by_average(table)))
+
+    if not populated:
+        return []
+
+    vmax = _section_vmax([t for _, _, t in populated], metric)
 
     out: list[str] = [f"\n## {pretty_metric} matrices (detector × descriptor)"]
     out.append(
         f"One heatmap per (estimator × attempt). Rows/columns are sorted by "
         f"descending mean {pretty_metric}, so the strongest detectors sit at "
         f"the top and the strongest descriptors at the left. "
-        + ("Colour: blue (low) → white → red (high)."
+        + ("Colour: red (low) → white → blue (high)."
            if metric == "maa"
-           else "Colour: green (low) → white → red (high).")
-        + "\n"
+           else "Colour: red (low) → white → green (high).")
+        + f" Colour scale: 0.0 → {vmax:.1f}.\n"
     )
 
-    any_section = False
-    for est in estimators:
-        for attempt in _ATTEMPTS:
-            table = _metric_matrix(df, est, attempt, metric, tiers)
-            if table.empty or table.isna().all().all():
-                continue
-            ordered = _order_by_average(table)
+    # Pass 2: render each table against the shared scale.
+    for est, attempt, ordered in populated:
+        png_name = _heatmap_filename(metric, est, attempt)
+        _save_heatmap(
+            ordered, output_dir / png_name,
+            title=f"{pretty_metric} — {est} / {attempt}",
+            cmap=cmap, vmin=0.0, vmax=vmax,
+        )
 
-            png_name = _heatmap_filename(metric, est, attempt)
-            _save_heatmap(
-                ordered, output_dir / png_name,
-                title=f"{pretty_metric} — {est} / {attempt}",
-                cmap=cmap, vmin=0.0, vmax=1.0,
-            )
+        out.append(f"\n### {est} — {attempt}\n")
+        out.append(f"![{pretty_metric} {est} {attempt}](./{png_name})\n")
+        # Embed the same numbers as a table for precise lookup.
+        descriptors = list(ordered.columns)
+        out.append("| Detector | " + " | ".join(descriptors) + " |")
+        out.append("|" + "---|" * (len(descriptors) + 1))
+        for det, row in ordered.iterrows():
+            cells = [
+                f"{row[d]:.3f}" if d in row and not pd.isna(row[d]) else "N/A"
+                for d in descriptors
+            ]
+            out.append(f"| {det} | " + " | ".join(cells) + " |")
 
-            out.append(f"\n### {est} — {attempt}\n")
-            out.append(f"![{pretty_metric} {est} {attempt}](./{png_name})\n")
-            # Embed the same numbers as a table for precise lookup.
-            descriptors = list(ordered.columns)
-            out.append("| Detector | " + " | ".join(descriptors) + " |")
-            out.append("|" + "---|" * (len(descriptors) + 1))
-            for det, row in ordered.iterrows():
-                cells = [
-                    f"{row[d]:.3f}" if d in row and not pd.isna(row[d]) else "N/A"
-                    for d in descriptors
-                ]
-                out.append(f"| {det} | " + " | ".join(cells) + " |")
-            any_section = True
-
-    return out if any_section else []
+    return out
 
 
 # ---------- Section: fallback benefit (one table per estimator) ----------
@@ -534,9 +669,9 @@ def _fallback_benefit_table(df: pd.DataFrame, estimator: str,
         paired = group.dropna(subset=["no_mask_result", "with_mask_result"])
         if paired.empty:
             continue
-        nm = _maa(paired["no_mask_result"], tiers)
-        wm = _maa(paired["with_mask_result"], tiers)
-        bo = _maa(paired["best_of_both_result"].dropna(), tiers)
+        nm = _maa(paired["no_mask_err"]       if "no_mask_err"       in paired.columns else pd.Series(dtype=float), tiers)
+        wm = _maa(paired["with_mask_err"]     if "with_mask_err"     in paired.columns else pd.Series(dtype=float), tiers)
+        bo = _maa(paired["best_of_both_err"]  if "best_of_both_err"  in paired.columns else pd.Series(dtype=float), tiers)
         rows.append({
             "config": f"{det}+{desc}",
             "maa_no_mask": nm,
@@ -602,9 +737,10 @@ def write_summary_report(csv_path: Path, output_dir: Path) -> None:
       acc@T, false_match, no_match.
     * **mAA matrices** — heatmap PNG + numeric table per (estimator × attempt),
       up to 6 of each. Detectors (rows) and descriptors (columns) sorted by
-      descending mean mAA. Colour: blue → white → red.
+      descending mean mAA. Colour: red (low) → white → blue (high), shared
+      scale across the section (see :func:`_section_vmax`).
     * **Precision matrices** — same layout as mAA matrices but coloured
-      green → white → red.
+      red (low) → white → green (high).
     * **Fallback benefit** — one table per estimator. Per detector+descriptor
       combo, lift of the best_of_both policy over each single attempt.
 
@@ -617,6 +753,7 @@ def write_summary_report(csv_path: Path, output_dir: Path) -> None:
 
     df = pd.read_csv(csv_path)
     df = _add_best_of_both_column(df)
+    df = _add_best_of_both_err_column(df)
 
     # Discover the accuracy tiers present anywhere in the data.
     tiers: list[float] = []

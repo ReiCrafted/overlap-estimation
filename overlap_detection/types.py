@@ -175,11 +175,12 @@ class PairResult:
     n_raw_matches : int
         Number of descriptor matches before geometric filtering.
     n_inliers : int
-        Number of RANSAC / USAC inliers used to estimate the homography.
+        Number of RANSAC / USAC inliers supporting the estimated affine.
 
-    homography : numpy.ndarray or None
-        Estimated ``(3, 3)`` homography matrix (``float64``), or ``None`` if
-        verification failed.
+    affine_matrix : numpy.ndarray or None
+        Estimated ``(2, 3)`` affine transformation matrix (``float64``)
+        mapping image-A coordinates to image-B coordinates, or ``None`` if
+        verification failed or the affine sanity check rejected it.
     inlier_mask : numpy.ndarray or None
         Boolean array of shape ``(n_raw_matches,)`` indicating inliers, or
         ``None`` if verification failed.
@@ -197,17 +198,17 @@ class PairResult:
         Wall-clock time for the matching stage (seconds).
     time_verification_s : float
         Wall-clock time for the verification stage (seconds).
+    time_geometry_s : float
+        Wall-clock time for the overlap-geometry stage (seconds).
     time_total_s : float
         Total wall-clock time for the full pipeline run (seconds).
 
-    fallback_triggered : bool
-        ``True`` if the fallback mask mode was activated during this run.
-    success : bool
-        ``True`` if a valid homography was produced (inliers ≥
-        ``RunConfig.fallback_min_inliers``).
     error_message : str or None
-        Human-readable description of any exception or failure condition,
-        ``None`` on success.
+        Human-readable description of any exception or failure condition.
+        ``None`` when the pipeline ran without hitting any rejection gate.
+
+    result_label : str
+        Ordinal accuracy categorisation; see the field docstring below.
 
     extra : dict
         Arbitrary key-value store for experimental metadata not captured by
@@ -255,15 +256,15 @@ class PairResult:
     result_label: str = "no_match"
     """Ordinal accuracy categorisation of this attempt.  Derived at metrics
     time from the configured ``RunConfig.accuracy_tiers_px`` and the measured
-    corner RMS error vs. ground truth.  Possible values:
+    mean corner error vs. ground truth.  Possible values:
 
     * ``"no_match"``    — no transform produced (insufficient matches,
                           affine-sanity rejection, or RANSAC failure).
-    * ``"false_match"`` — transform produced but corner RMS exceeded the
-                          loosest accuracy tier.
-    * ``"acc_at_<T>"``  — transform produced and corner RMS ≤ T px, where T
-                          is the smallest tier the result cleared (e.g.
-                          ``"acc_at_3"`` is strictly better than
+    * ``"false_match"`` — transform produced but the mean corner error
+                          exceeded the loosest accuracy tier.
+    * ``"acc_at_<T>"``  — transform produced and mean corner error ≤ T px,
+                          where T is the smallest tier the result cleared
+                          (e.g. ``"acc_at_3"`` is strictly better than
                           ``"acc_at_5"`` which is strictly better than
                           ``"acc_at_10"``).
     """

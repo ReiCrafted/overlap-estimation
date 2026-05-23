@@ -13,6 +13,7 @@ from .verification import verify_affine
 from .geometry import compute_overlap_polygon, apply_affine, invert_affine
 from .metrics import (
     per_corner_errors,
+    corner_errors_hpatches,
     mean_corner_error,
     overlap_iou,
     compute_pair_metrics,
@@ -55,6 +56,7 @@ __all__ = [
     "invert_affine",
     # metrics
     "per_corner_errors",
+    "corner_errors_hpatches",
     "mean_corner_error",
     "overlap_iou",
     "compute_pair_metrics",

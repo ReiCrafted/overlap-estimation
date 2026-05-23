@@ -24,10 +24,10 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=7.0.0"]
 
-[project.scripts]
-overlap-run        = "scripts.run_experiment:main"
-overlap-annotate   = "scripts.annotate_dataset:main"
-overlap-report     = "scripts.generate_report:main"
+# CLI entrypoints are invoked directly as `python scripts/<name>.py` (each
+# script prepends the repo root to sys.path).  We deliberately do not expose
+# console scripts: `scripts/` is not a Python package (no __init__.py) and is
+# excluded from the installed wheel below.
 
 [tool.setuptools.packages.find]
 include = ["overlap_detection*"]

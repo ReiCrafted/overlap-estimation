@@ -138,9 +138,13 @@ def describe(
         x, y = cv_kp.pt
         sigma = (cv_kp.size / 2) if cv_kp.size > 0 else None
         theta = np.radians(cv_kp.angle) if cv_kp.angle != -1 else None
+        # Preserve class_id round-trip (the AKAZE→MLDB native path is the
+        # only consumer today, but keep the field intact so future descriptors
+        # that key off scale-space level don't silently lose information).
+        class_id = cv_kp.class_id if cv_kp.class_id >= 0 else None
         filtered_kps.append(Keypoint(
             x=float(x), y=float(y), response=float(cv_kp.response),
-            sigma=sigma, theta=theta, octave=cv_kp.octave
+            sigma=sigma, theta=theta, octave=cv_kp.octave, class_id=class_id,
         ))
 
     return filtered_kps, desc_mat
