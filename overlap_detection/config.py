@@ -191,8 +191,8 @@ class RunConfig:
 
     min_inliers: int = 8
     """Minimum inlier count for an estimated affine to be retained.  An
-    estimate that fails this gate (or the affine sanity check) yields the
-    ``"no_match"`` categorical result."""
+    estimate that fails this gate (or whose underlying RANSAC call returned
+    no transform) yields the ``"no_match"`` categorical result."""
 
     accuracy_tiers_px: tuple[float, ...] = (3.0, 5.0, 10.0)
     """Corner-RMS thresholds (px) that define the ordinal accuracy tiers

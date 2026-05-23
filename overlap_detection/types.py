@@ -180,7 +180,8 @@ class PairResult:
     affine_matrix : numpy.ndarray or None
         Estimated ``(2, 3)`` affine transformation matrix (``float64``)
         mapping image-A coordinates to image-B coordinates, or ``None`` if
-        verification failed or the affine sanity check rejected it.
+        verification failed (RANSAC returned no transform, or the inlier
+        count fell below ``RunConfig.min_inliers``).
     inlier_mask : numpy.ndarray or None
         Boolean array of shape ``(n_raw_matches,)`` indicating inliers, or
         ``None`` if verification failed.
@@ -258,8 +259,9 @@ class PairResult:
     time from the configured ``RunConfig.accuracy_tiers_px`` and the measured
     mean corner error vs. ground truth.  Possible values:
 
-    * ``"no_match"``    — no transform produced (insufficient matches,
-                          affine-sanity rejection, or RANSAC failure).
+    * ``"no_match"``    — no transform produced (insufficient keypoints,
+                          insufficient matches, too few RANSAC inliers,
+                          or the RANSAC call returned no transform).
     * ``"false_match"`` — transform produced but the mean corner error
                           exceeded the loosest accuracy tier.
     * ``"acc_at_<T>"``  — transform produced and mean corner error ≤ T px,

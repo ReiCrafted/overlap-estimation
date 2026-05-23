@@ -112,10 +112,17 @@ def describe(
                 ))
             return filtered_kps, desc_mat
         else:
-            return mldb_describe(gray_img, keypoints, default_sigma)
+            # Custom NumPy MLDB path consumes the same descriptor_params dict
+            # as the native AKAZE path, but its accepted keys are different
+            # (patch_size, sigma_scale, smooth_sigma, grids).  See mldb.py.
+            return mldb_describe(gray_img, keypoints, default_sigma,
+                                 **descriptor_params)
     elif descriptor_name == "LIOP":
         # LIOP is handled entirely in NumPy — bypass the OpenCV compute() path.
-        return liop_describe(gray_img, keypoints, default_sigma)
+        # Accepted descriptor_params keys: n_neighbors, n_bins, patch_size,
+        # patch_radius_sigmas.  See liop.py.
+        return liop_describe(gray_img, keypoints, default_sigma,
+                             **descriptor_params)
     else:
         raise ValueError(f"Unknown descriptor: {descriptor_name}")
 

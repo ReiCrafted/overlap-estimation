@@ -89,8 +89,8 @@ The overlap detection system is built around a multi-stage sequential pipeline m
    - Outputs: `(filtered_keypoints, descriptor_matrix)`. OpenCV's `compute()` may drop keypoints too close to the image edge; the returned keypoint list is the surviving subset and indexes the descriptor rows 1:1.
    - **Upright by default.** Every keypoint is passed to OpenCV with `angle=0.0` regardless of what the detector reported. Scale `sigma` is taken from the keypoint, falling back to `RunConfig.descriptor_default_sigma` (default `6.0`); the cv2 keypoint receives `size = sigma * 2`. Per-descriptor upright overrides applied on top of `RunConfig.descriptor_params`:
 
-     | Name      | Backing call                                       | Forced parameters (override `descriptor_params`) | Dim × dtype |
-     |-----------|----------------------------------------------------|--------------------------------------------------|-------------|
+     | Name      | Backing call                                       | Forced parameters (override `descriptor_params`) | Dim × dtype at defaults |
+     |-----------|----------------------------------------------------|--------------------------------------------------|-------------------------|
      | SIFT      | `cv2.SIFT_create`                                  | (none)                                           | 128 float32 |
      | RootSIFT  | `cv2.SIFT_create` + L1-norm + element-wise sqrt    | (none)                                           | 128 float32, L2-unit |
      | USURF     | `cv2.xfeatures2d.SURF_create`                      | `upright=True`                                   | 64 float32 |
@@ -101,15 +101,17 @@ The overlap detection system is built around a multi-stage sequential pipeline m
      | MLDB      | see routing below                                  | (none)                                           | 61 bytes uint8 |
      | LIOP      | `overlap_detection.liop.liop_describe` (NumPy)     | n/a                                              | 144 float32, per-bin L2-unit |
 
+   - **`RunConfig.descriptor_params` forwarding.** The dict is `**`-unpacked into the underlying call for **every** descriptor — OpenCV factory kwargs for the OpenCV-backed ones (e.g. `BRIEF` accepts `bytes ∈ {16, 32, 64}`; `DAISY` accepts `radius, q_radius, q_theta, q_hist, …`; full keyword sets are in OpenCV's docs), and the keyword arguments of `liop_describe` / `mldb_describe` for the two custom paths. Unknown keys surface as the underlying call's standard `TypeError: unexpected keyword argument`. For the custom paths the accepted keys are listed in their respective sections of this document (and in the module docstrings).
    - **Binary vs. float discrimination.** `is_binary_descriptor(name)` returns `True` for `{BRIEF, BRISK, SUFREAK, MLDB}`. Consumed by `matching.py` to pick `NORM_HAMMING` vs. `NORM_L2`.
    - **MLDB routing decision** (`description.py`):
-     - **Native AKAZE path** (`cv2.AKAZE_create(descriptor_type=AKAZE_DESCRIPTOR_MLDB_UPRIGHT).compute`) is taken **iff** all of:
+     - **Native AKAZE path** (`cv2.AKAZE_create(descriptor_type=AKAZE_DESCRIPTOR_MLDB_UPRIGHT, **descriptor_params).compute`) is taken **iff** all of:
        - `detector_name == "AKAZE"`, and
        - the keypoint list is non-empty, and
        - the first keypoint has `class_id is not None` and `class_id >= 0`.
+       - In this case `descriptor_params` accepts the standard `cv2.AKAZE_create` kwargs (`descriptor_size, descriptor_channels, nOctaves, nOctaveLayers, diffusivity, threshold`).
      - Otherwise the custom NumPy MLDB (`overlap_detection.mldb.mldb_describe`) runs. KAZE keypoints take this route too — they also carry `class_id`, but it indexes a *linear* diffusion pyramid while AKAZE's MLDB expects a *nonlinear* one, so handing KAZE class_ids to AKAZE's `compute()` would be semantically wrong.
-   - **LIOP routing.** The OpenCV path is bypassed entirely; `liop_describe` is called directly.
-   - **Empty-input behaviour.** If `keypoints` is empty, `(list(), np.array([]))` is returned without invoking OpenCV.
+   - **LIOP routing.** The OpenCV path is bypassed entirely; `liop_describe` is called directly with `**descriptor_params`.
+   - **Empty-input behaviour.** If `keypoints` is empty, `(list(), empty array)` is returned without invoking OpenCV.
    - **Unknown descriptor name** → `ValueError(f"Unknown descriptor: {name}")`.
 
 4. **Stage 4: Matching & Filtering** (`matching.py`)
@@ -134,10 +136,10 @@ The overlap detection system is built around a multi-stage sequential pipeline m
      1. `len(matches) < 3` → returns `(None, zeros(0,))` before calling cv2.
      2. `cv2.estimateAffine2D` returned `affine_matrix is None` → returns `(None, zeros(len(matches),))`.
      3. `inlier_count < 3` after RANSAC → returns `(None, inlier_mask)`. This is a hard lower bound for any affine; the orchestrator's `min_inliers` gate (below) is the tunable, stricter check.
-   - **Orchestrator acceptance gates** (applied in order in `_execute_pipeline`, after `verify_affine` returns a non-None matrix):
-     1. **Min-inliers gate** — `n_inliers ≥ RunConfig.min_inliers` (default `8`). Failure sets `error_message = "Too few inliers (N < M)"` and leaves `result.affine_matrix = None`.
-     2. **Affine sanity gate** — `_affine_is_sane` decomposes the 2×2 sub-matrix as `scale = sqrt(a00² + a10²)`, `rotation_deg = degrees(atan2(a10, a00))`. The affine is rejected if `|scale − 1| > _MAX_SCALE_DIFF` (10 %) **or** `|rotation_deg| > _MAX_ROTATION_DEG` (3°). Thresholds are module-level constants in `orchestrator.py`, **not** in `RunConfig` (see §Hard-coded constants).
-   - **On rejection** by any of the above, `result.affine_matrix` is set to `None`, `result.error_message` records the specific reason, downstream stages (overlap geometry, GT-comparison) are skipped, and `categorize_result` produces `"no_match"`.
+   - **Orchestrator acceptance gate** (applied in `_execute_pipeline` after `verify_affine` returns a non-None matrix):
+     - **Min-inliers gate** — `n_inliers ≥ RunConfig.min_inliers` (default `8`). Failure sets `error_message = "Too few inliers (N < M)"` and leaves `result.affine_matrix = None`.
+   - **No geometric sanity gate.** The pipeline intentionally does **not** apply scale-or-rotation sanity thresholds to the RANSAC output. With ground truth always present at this stage, an implausible affine is caught by the corner-error metric (Stage 7) and labelled `false_match`, which surfaces in the Precision metric. Adding an internal sanity gate would split that population between `no_match` (abstention) and `false_match` (wrong commit) on a hand-tuned threshold, distorting Precision; we let every successfully-estimated affine reach the metric stage so the same threshold (the configured accuracy tiers) decides whether it was right or wrong.
+   - **On rejection** by any early-out or the min-inliers gate, `result.affine_matrix` is set to `None`, `result.error_message` records the specific reason, downstream stages (overlap geometry, GT-comparison) are skipped, and `categorize_result` produces `"no_match"`.
    - **On acceptance**, `result.affine_matrix` and `result.inlier_mask` are stored on the `PairResult`.
 
 6. **Stage 6: Overlap Geometry** (`geometry.py`)
@@ -314,6 +316,26 @@ class RunConfig:
 - `save_intermediate` — no stage consumes this; intermediate artefacts (masked images, match visualisations) are not currently persisted.
 - `random_seed` — no stage seeds an RNG from this; the OpenCV USAC estimators have no `seed` parameter, and the rest of the pipeline is deterministic.
 
+### `detector_params` and `descriptor_params` — what they accept
+
+Both dicts are forwarded as `**kwargs` to the underlying call for the chosen algorithm and **overlay** the per-algorithm defaults documented in §Pipeline Architecture (Stage 2 / Stage 3 tables). Every parameter the underlying call accepts is reachable through these dicts — there is no allow-list filtering on this side. Unknown keys surface as the standard `TypeError: ... got an unexpected keyword argument` from the underlying call.
+
+- **OpenCV-backed detectors and descriptors** — keys are the keyword arguments of the relevant `cv2.X_create` factory (or `cv2.goodFeaturesToTrack` for Harris / GFTT, `cv2.MSER_create` + `detectRegions` for MSER). Consult the OpenCV docs for the per-class kwarg list (e.g. `cv2.SIFT_create.__doc__`, `help(cv2.xfeatures2d.DAISY_create)`).
+- **Custom LIOP descriptor** — accepts `n_neighbors`, `n_bins`, `patch_size`, `patch_radius_sigmas` (full table in §Custom Descriptor Implementations / LIOP).
+- **Custom MLDB descriptor (non-AKAZE path)** — accepts `patch_size`, `sigma_scale`, `smooth_sigma`, `grids` (full table in §Custom Descriptor Implementations / MLDB).
+- **Native MLDB via AKAZE** — accepts the standard `cv2.AKAZE_create` kwargs except `descriptor_type`, which is always forced to `AKAZE_DESCRIPTOR_MLDB_UPRIGHT`.
+
+Example overrides:
+
+```python
+RunConfig(
+    detector="SIFT",
+    detector_params={"contrastThreshold": 0.02, "nOctaveLayers": 5},
+    descriptor="LIOP",
+    descriptor_params={"n_bins": 8, "patch_size": 51},  # → 8 * 24 = 192-dim
+)
+```
+
 ---
 
 ## Hard-coded constants outside RunConfig
@@ -324,8 +346,6 @@ The constants listed below influence pipeline behaviour but are deliberately **n
 
 | Constant                            | Value | Effect |
 |-------------------------------------|-------|--------|
-| `_MAX_SCALE_DIFF`                   | `0.10` | Affine-sanity gate rejects an estimate when `|scale − 1| > 0.10`. |
-| `_MAX_ROTATION_DEG`                 | `3.0`  | Affine-sanity gate rejects an estimate when `|rotation_deg| > 3.0`. |
 | `_DEFAULT_EXPERIMENT_WORKER_CAP`    | `8`    | Upper bound for `default_experiment_workers()`; actual worker count is `min(cpu_count − 1, 8)` floored at 1. |
 
 `_ATTEMPT_COLUMN_PREFIX = {"no_mask": "no_mask", "mask": "with_mask"}` controls the CSV column prefixes per attempt (the asymmetric "mask" → "with_mask" rename keeps `mask_*` from colliding with the `mask_mode` identifier column).
@@ -354,24 +374,33 @@ The constants listed below influence pipeline behaviour but are deliberately **n
 
 ### `mldb.py` (custom MLDB descriptor — non-AKAZE path)
 
-| Constant      | Value | Effect |
-|---------------|-------|--------|
-| `_PATCH_SIZE` | `60` px | Side length of the warped patch; divisible by 2, 3, and 4 so every grid cell is integer-sized. |
-| `_SIGMA_SCALE`| `10.0` | Physical patch half-side = `sigma * 10` (matches AKAZE's `pattern_size = 10`). |
-| `_SMOOTH_SIGMA` | `1.5` | Gaussian sigma applied to the patch before computing Lx/Ly (approximates AKAZE's nonlinear diffusion image Lt). |
-| `_GRIDS`      | `[(2,2), (3,3), (4,4)]` | Three subdivision passes; their cell-pair counts × 3 channels sum to `DESC_BITS = 486`. |
-| `DESC_BITS` / `DESC_BYTES` | `486` / `61` | Derived dimensions (`(486+7)//8`). |
+The MLDB hyper-parameters listed below are the module-level **defaults** —
+they are **also reachable through `RunConfig.descriptor_params`** (see
+§Custom Descriptor Implementations / MLDB for the full kwarg list and
+validation rules). Listed here only so the reader knows the values that
+apply when `descriptor_params == {}`.
+
+| Constant / kwarg | Default | Effect |
+|---|---|---|
+| `DEFAULT_PATCH_SIZE` (`patch_size`) | `60` px | Side length of the warped patch; must be divisible by every grid dim. |
+| `DEFAULT_SIGMA_SCALE` (`sigma_scale`) | `10.0` | Physical patch half-side = `sigma * sigma_scale`. |
+| `DEFAULT_SMOOTH_SIGMA` (`smooth_sigma`) | `1.5` | Gaussian σ applied to the patch before Sobel (approximates Lt). |
+| `DEFAULT_GRIDS` (`grids`) | `((2,2), (3,3), (4,4))` | Three subdivision passes; cell-pair counts × 3 channels sum to `DESC_BITS = 486`. |
+| `DESC_BITS` / `DESC_BYTES` | `486` / `61` | Derived from `DEFAULT_GRIDS` (`(486+7)//8`). |
 
 ### `liop.py` (LIOP descriptor)
 
-| Constant     | Value | Effect |
-|--------------|-------|--------|
-| `_PATCH_SIZE` / `_PATCH_RADIUS` | `41` / `20` px | Fixed warped-patch dimensions; the in-circle pixel set is precomputed at import time. |
-| `_N_NEIGHBORS` | `4`  | K nearest neighbours per sample point; `K! = 24` distinct ordinal codes. |
-| `_N_BINS`    | `6`   | Equal-population ordinal intensity bins. |
-| `_N_CODES`   | `24` (= `4!`) | Codes per bin. |
-| `DESC_DIM`   | `144` (`6 × 24`) | Final descriptor length. |
-| Patch physical radius | `3 * sigma` | Set inside `_extract_patch`; falls back to `default_sigma` from RunConfig when the keypoint has none. |
+Same note as MLDB — the values below are the defaults; every one is
+overridable through `RunConfig.descriptor_params` (see §Custom Descriptor
+Implementations / LIOP).
+
+| Constant / kwarg | Default | Effect |
+|---|---|---|
+| `DEFAULT_PATCH_SIZE` (`patch_size`) | `41` px | Warped-patch side length; must be odd. |
+| `DEFAULT_N_NEIGHBORS` (`n_neighbors`) | `4` | K nearest neighbours per sample point; `K!` ordinal codes per bin. |
+| `DEFAULT_N_BINS` (`n_bins`) | `6` | Equal-population ordinal intensity bins. |
+| `DEFAULT_PATCH_RADIUS_SIGMAS` (`patch_radius_sigmas`) | `3.0` | Physical patch radius = `sigma * patch_radius_sigmas`. |
+| `DESC_DIM` (derived) | `144` (`6 × 24`) | At defaults: `n_bins * factorial(n_neighbors)`. |
 
 ### `reporting.py`
 
@@ -521,17 +550,28 @@ pip-installable Python binding exists for any other LIOP implementation.
    `np.bincount`, then each bin's histogram is L2-normalised independently.
 6. The 6 histograms are concatenated to form the final descriptor.
 
-**Descriptor properties:**
+**Descriptor properties (at defaults):**
 
 | Property | Value |
 |---|---|
-| Dimension | 144 (6 bins × 24 codes) |
+| Dimension | 144 (= `n_bins * factorial(n_neighbors)` = 6 × 24) |
 | Dtype | float32 |
 | Binary? | No — use BFMatcher with NORM_L2 |
 | Detector coupling | None — works with any detector |
-| Patch size | 41 × 41 px (fixed) |
+| Patch size | 41 × 41 px |
 | Physical patch radius | 3σ |
-| Import-time precomputation | ~12 MB temporary (KNN distances), ~20 KB kept (index table) |
+| Per-config precomputation | ~12 MB temporary (KNN distances), ~20 KB kept (index table); cached via `functools.lru_cache(maxsize=16)` keyed on `(n_neighbors, n_bins, patch_size)` so the first call at a given config pays the cost and subsequent calls hit the cache |
+
+**Configurable hyper-parameters** (pass via `RunConfig.descriptor_params`):
+
+| Key                    | Default | Type  | Effect |
+|------------------------|---------|-------|--------|
+| `n_neighbors`          | `4`     | int ≥ 2 | K in the paper. Generates `K!` ordinal codes per sample point. |
+| `n_bins`               | `6`     | int ≥ 1 | Number of equal-population ordinal intensity bins. |
+| `patch_size`           | `41`    | odd int ≥ 3 | Warped-patch side length in pixels. |
+| `patch_radius_sigmas`  | `3.0`   | float | Physical patch radius = `kp.sigma * patch_radius_sigmas`. |
+
+Descriptor dimension is therefore `n_bins * factorial(n_neighbors)` — `144` at defaults; e.g. `n_bins=3` halves it to `72`, `n_neighbors=3` shrinks it to `n_bins * 6 = 36`. Invalid params raise `ValueError` at the start of `liop_describe` (before any per-keypoint work).
 
 **Matching override (orchestrator.py):**
 
@@ -624,7 +664,7 @@ AKAZE sets it during `detect()`, `_cv_kp_to_keypoint` preserves it, and
 `describe()` passes it back to `cv2.AKAZE_create().compute()` via a
 reconstructed `cv2.KeyPoint`.
 
-**Descriptor properties:**
+**Descriptor properties (at defaults):**
 
 | Property | Value |
 |---|---|
@@ -632,9 +672,33 @@ reconstructed `cv2.KeyPoint`.
 | Dtype | uint8 (packed bits) |
 | Binary? | Yes — use BFMatcher with NORM_HAMMING |
 | Detector coupling | None (custom path) / AKAZE+KAZE (native path) |
-| Patch size | 60 × 60 px (fixed, custom path only) |
-| Physical patch half-side | 10σ (custom path only) |
-| Import-time precomputation | Cell-pair index arrays (trivial, < 1 KB) |
+| Patch size | 60 × 60 px (custom path) |
+| Physical patch half-side | 10σ (custom path) |
+| Per-config precomputation | Cell-pair index arrays, trivial (< 1 KB), cached via `functools.lru_cache(maxsize=16)` keyed on `(patch_size, grids)` |
+
+**Configurable hyper-parameters — custom NumPy path** (pass via `RunConfig.descriptor_params`):
+
+| Key            | Default                  | Type | Effect |
+|----------------|--------------------------|------|--------|
+| `patch_size`   | `60`                     | int ≥ 2; must be divisible by every grid dim | Warped-patch side length. |
+| `sigma_scale`  | `10.0`                   | float | Physical patch half-side = `kp.sigma * sigma_scale`. Matches AKAZE's `pattern_size = 10`. |
+| `smooth_sigma` | `1.5`                    | float | Gaussian σ applied to the patch before Sobel (approximates AKAZE's diffusion image Lt). |
+| `grids`        | `((2,2), (3,3), (4,4))`  | sequence of `(rows, cols)` | Subdivisions used to build the comparison set; final bit count = `sum_grids(C(rows*cols, 2)) * 3`. |
+
+Descriptor byte count is derived: `ceil(sum_grids(C(rows*cols, 2)) * 3 / 8)`. Defaults give 486 bits → 61 bytes; e.g. `grids=((2,2),)` collapses to 18 bits → 3 bytes. `patch_size` indivisible by any grid dim raises `ValueError` from `_layout` *before* any per-keypoint work.
+
+**Configurable hyper-parameters — native AKAZE path** (taken only when `detector_name == "AKAZE"`; `descriptor_params` is forwarded directly to `cv2.AKAZE_create`):
+
+| Key                     | OpenCV default | Notes |
+|-------------------------|----------------|-------|
+| `descriptor_size`       | `0`            | `0` → full 486-bit descriptor; non-zero truncates. |
+| `descriptor_channels`   | `3`            | Number of channels per comparison (`{Lt}`, `{Lt, Lx}`, `{Lt, Lx, Ly}`). |
+| `nOctaves`              | `4`            | Pyramid octaves. |
+| `nOctaveLayers`         | `4`            | Sub-levels per octave. |
+| `diffusivity`           | `cv2.KAZE_DIFF_PM_G2` | Nonlinear diffusion equation choice. |
+| `threshold`             | `0.001`        | Detector response threshold (only meaningful when this AKAZE instance is also detecting, which it isn't here — kept for completeness). |
+
+`descriptor_type` is **always** forced to `cv2.AKAZE_DESCRIPTOR_MLDB_UPRIGHT` regardless of `descriptor_params`.
 
 **Approximation note (custom path only):** The NumPy implementation substitutes
 Gaussian smoothing and Sobel gradients for AKAZE's true nonlinear diffusion
