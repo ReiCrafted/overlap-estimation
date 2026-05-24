@@ -2,7 +2,7 @@ from .config import RunConfig, DETECTOR_NAMES, DESCRIPTOR_NAMES, VALID_PAIRINGS
 from .types import Image, Mask, DescriptorMatrix, Keypoint, PairResult, GroundTruth
 from .preprocessing import (
     make_overlap_band_mask,
-    make_grayness_mask,
+    make_saturation_brightness_mask,
     combine_masks,
     apply_mask_mode,
 )
@@ -13,9 +13,9 @@ from .verification import verify_affine
 from .geometry import compute_overlap_polygon, apply_affine, invert_affine
 from .metrics import (
     per_corner_errors,
-    corner_errors_hpatches,
+    corner_errors_overlap_polygon,
     mean_corner_error,
-    overlap_iou,
+    pixel_correspondence_rate,
     compute_pair_metrics,
     categorize_result,
 )
@@ -38,7 +38,7 @@ __all__ = [
     "GroundTruth",
     # preprocessing
     "make_overlap_band_mask",
-    "make_grayness_mask",
+    "make_saturation_brightness_mask",
     "combine_masks",
     "apply_mask_mode",
     # detection
@@ -56,9 +56,9 @@ __all__ = [
     "invert_affine",
     # metrics
     "per_corner_errors",
-    "corner_errors_hpatches",
+    "corner_errors_overlap_polygon",
     "mean_corner_error",
-    "overlap_iou",
+    "pixel_correspondence_rate",
     "compute_pair_metrics",
     "categorize_result",
     # reporting

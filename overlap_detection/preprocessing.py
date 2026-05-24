@@ -20,17 +20,32 @@ def make_overlap_band_mask(
             mask[:, -band_width:] = 255
     return mask
 
-def make_grayness_mask(
+
+def make_saturation_brightness_mask(
     image: np.ndarray,
-    gray_threshold: int,
+    sat_threshold: float = 0.12,
+    brightness_lo: int = 15,
+    brightness_hi: int = 180,
 ) -> np.ndarray:
-    """Returns mask of shape (H, W) with 0 where pixel is 'gray-ish'
-    (max channel - min channel <= gray_threshold) and 255 elsewhere.
-    Operates on RGB images (uint8). Excludes gray plastic cassette
-    frames per thesis §5.2.1."""
-    ptp = np.ptp(image, axis=2)
-    mask = np.where(ptp <= gray_threshold, 0, 255).astype(np.uint8)
-    return mask
+    """Returns mask with 0 where the pixel matches the cassette-frame
+    signature (low saturation AND brightness in the plastic-frame band),
+    255 elsewhere.
+
+    Operates on uint8 RGB. Empirically derived from per-pixel CSV samples
+    of frame vs. non-frame regions (see project_overview.md §Stage 1).
+    The frame pixels cluster tightly at low saturation = (max-min)/max
+    and brightness = max(R,G,B) in a mid-range band; non-frame (plant /
+    soil) pixels are either much darker, much brighter, or significantly
+    chromatic.
+    """
+    img = image.astype(np.float32)
+    ch_max = img.max(axis=2)
+    ch_min = img.min(axis=2)
+    sat = np.divide(ch_max - ch_min, ch_max,
+                    out=np.zeros_like(ch_max), where=ch_max > 0)
+    is_frame = (sat < sat_threshold) & (ch_max >= brightness_lo) & (ch_max <= brightness_hi)
+    return np.where(is_frame, 0, 255).astype(np.uint8)
+
 
 def combine_masks(*masks: np.ndarray) -> np.ndarray:
     """Bitwise AND of multiple masks."""
@@ -41,23 +56,28 @@ def combine_masks(*masks: np.ndarray) -> np.ndarray:
         result = cv2.bitwise_and(result, mask)
     return result
 
+
 def apply_mask_mode(
     image: np.ndarray,
     mode: str,
     band_fraction: float,
-    gray_threshold: int,
     side: str = "both",
+    sat_threshold: float = 0.12,
+    brightness_lo: int = 15,
+    brightness_hi: int = 180,
 ) -> np.ndarray:
-    """Returns final detection mask per mode:
-    - "no_mask": only the overlap band mask
-    - "mask": overlap band AND grayness mask combined
-    - "fallback": returns the no_mask mask; fallback logic that re-runs
-      with the stricter mask is handled by the orchestrator, not here
+    """Returns the final detection mask per mode:
+    - "no_mask":  overlap band mask only
+    - "mask":     overlap band AND saturation/brightness frame mask
+    - "fallback": same as "no_mask" (legacy alias); fallback re-run logic
+                  that swaps in the stricter mask lives in the orchestrator
     """
     band_mask = make_overlap_band_mask(image.shape, band_fraction, side=side)
     if mode == "mask":
-        gray_mask = make_grayness_mask(image, gray_threshold)
-        return combine_masks(band_mask, gray_mask)
+        sat_mask = make_saturation_brightness_mask(
+            image, sat_threshold, brightness_lo, brightness_hi,
+        )
+        return combine_masks(band_mask, sat_mask)
     elif mode in ("no_mask", "fallback"):
         return band_mask
     else:

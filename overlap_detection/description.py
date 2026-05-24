@@ -4,6 +4,37 @@ from overlap_detection.types import Keypoint
 from overlap_detection.liop import liop_describe
 from overlap_detection.mldb import mldb_describe
 
+# ---------------------------------------------------------------------------
+# Per-descriptor default parameters
+# ---------------------------------------------------------------------------
+# These are the baseline kwargs forwarded to each descriptor factory.
+# RunConfig.descriptor_params are merged on top (user values win).
+# Forced overrides (upright, use_orientation, etc.) are applied *after* the
+# merge in describe() so they cannot be accidentally overridden by the user.
+# MLDB and LIOP defaults live in their own modules; entries here are empty
+# so the merge is a no-op and the module-level defaults take effect.
+# ---------------------------------------------------------------------------
+
+_DESCRIPTOR_DEFAULTS: dict[str, dict] = {
+    "SIFT":     {},
+    "RootSIFT": {},
+    "USURF":    {"hessianThreshold": 100},   # upright=True is a forced override
+    "DAISY":    {},                           # use_orientation=False is a forced override
+    "BRIEF":    {"bytes": 64}, #changed for theoretical testing
+    "BRISK":    {"thresh": 30, "octaves": 4},
+    "SUFREAK":  {},                           # orientationNormalized/scaleNormalized are forced overrides
+    "MLDB":     {},                           # defaults live in mldb.py / cv2.AKAZE_create
+    "LIOP":     {},                           # defaults live in liop.py
+}
+
+
+def _merged_desc_params(descriptor_name: str, user_params: dict) -> dict:
+    """Merge user overrides on top of descriptor defaults."""
+    params = _DESCRIPTOR_DEFAULTS.get(descriptor_name, {}).copy()
+    params.update(user_params)
+    return params
+
+
 def is_binary_descriptor(descriptor_name: str) -> bool:
     """True for BRIEF, BRISK, SUFREAK, MLDB. False for SIFT, RootSIFT, USURF, DAISY, LIOP."""
     return descriptor_name in ["BRIEF", "BRISK", "SUFREAK", "MLDB"]
@@ -42,25 +73,26 @@ def describe(
         cv_kps.append(cv_kp)
 
     if descriptor_name == "SIFT":
-        descriptor = cv2.SIFT_create(**descriptor_params)
+        descriptor = cv2.SIFT_create(**_merged_desc_params("SIFT", descriptor_params))
     elif descriptor_name == "RootSIFT":
-        descriptor = cv2.SIFT_create(**descriptor_params)
+        descriptor = cv2.SIFT_create(**_merged_desc_params("RootSIFT", descriptor_params))
     elif descriptor_name == "USURF":
-        params = descriptor_params.copy()
-        params["upright"] = True
+        params = _merged_desc_params("USURF", descriptor_params)
+        params["upright"] = True            # forced override — always upright
         descriptor = cv2.xfeatures2d.SURF_create(**params)
     elif descriptor_name == "DAISY":
-        params = descriptor_params.copy()
-        params["use_orientation"] = False   # upright — matches DAISY_create API
+        params = _merged_desc_params("DAISY", descriptor_params)
+        params["use_orientation"] = False   # forced override — always upright
         descriptor = cv2.xfeatures2d.DAISY_create(**params)
     elif descriptor_name == "BRIEF":
-        descriptor = cv2.xfeatures2d.BriefDescriptorExtractor_create(**descriptor_params)
+        descriptor = cv2.xfeatures2d.BriefDescriptorExtractor_create(
+            **_merged_desc_params("BRIEF", descriptor_params))
     elif descriptor_name == "BRISK":
-        descriptor = cv2.BRISK_create(**descriptor_params)
+        descriptor = cv2.BRISK_create(**_merged_desc_params("BRISK", descriptor_params))
     elif descriptor_name == "SUFREAK":
-        params = descriptor_params.copy()
-        params["orientationNormalized"] = False
-        params["scaleNormalized"] = False
+        params = _merged_desc_params("SUFREAK", descriptor_params)
+        params["orientationNormalized"] = False   # forced override
+        params["scaleNormalized"] = False          # forced override
         descriptor = cv2.xfeatures2d.FREAK_create(**params)
     elif descriptor_name == "MLDB":
         # Use OpenCV's native MLDB only for AKAZE keypoints.  AKAZE sets
@@ -95,7 +127,7 @@ def describe(
             ]
             akaze_desc = cv2.AKAZE_create(
                 descriptor_type=cv2.AKAZE_DESCRIPTOR_MLDB_UPRIGHT,
-                **descriptor_params,
+                **_merged_desc_params("MLDB", descriptor_params),
             )
             out_kps, desc_mat = akaze_desc.compute(gray_img, akaze_kps)
             if desc_mat is None:
@@ -116,13 +148,13 @@ def describe(
             # as the native AKAZE path, but its accepted keys are different
             # (patch_size, sigma_scale, smooth_sigma, grids).  See mldb.py.
             return mldb_describe(gray_img, keypoints, default_sigma,
-                                 **descriptor_params)
+                                 **_merged_desc_params("MLDB", descriptor_params))
     elif descriptor_name == "LIOP":
         # LIOP is handled entirely in NumPy — bypass the OpenCV compute() path.
         # Accepted descriptor_params keys: n_neighbors, n_bins, patch_size,
         # patch_radius_sigmas.  See liop.py.
         return liop_describe(gray_img, keypoints, default_sigma,
-                             **descriptor_params)
+                             **_merged_desc_params("LIOP", descriptor_params))
     else:
         raise ValueError(f"Unknown descriptor: {descriptor_name}")
 

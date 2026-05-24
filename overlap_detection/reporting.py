@@ -1,20 +1,28 @@
 """reporting.py — Per-pair JSON, aggregate CSV, markdown summary, and heatmaps.
 
-The markdown report covers headline numbers (overall mAA/Precision split by
-estimator × attempt, per-config scoreboards, fallback benefit) as tables.
+The markdown report covers headline numbers (overall mAA-OP / Precision split
+by estimator × attempt, per-config scoreboards, fallback benefit) as tables.
 Heatmap PNGs render the detector × descriptor matrices visually: one PNG per
 (metric × estimator × attempt) = 12 files for a full PROSAC + USAC_MAGSAC sweep.
 
 Row/column ordering on every heatmap is by descending **per-axis average** of
 the metric being plotted, so the strongest configurations sit in the top-left.
 Colour scales:
-  * mAA       → red–white–blue  (matplotlib "bwr_r")
+  * mAA-OP    → red–white–blue  (matplotlib "bwr_r")
   * Precision → red–white–green (custom LinearSegmentedColormap)
 
-mAA definition (standard AUC form, matching SuperGlue / glue-factory)
-----------------------------------------------------------------------
-mAA is computed from the per-pair **mean corner error** (``{attempt}_err``
-columns in the CSV), not from the ordinal result labels.
+mAA-OP definition (AUC form, overlap-polygon variant)
+-----------------------------------------------------
+"mAA-OP" stands for **mean Average Accuracy on the Overlap Polygon**.  Same
+AUC aggregation as the SuperGlue / glue-factory mAA, but the underlying
+per-pair error is the mean per-vertex distance on the **clipped overlap
+polygon** (see `metrics.corner_errors_overlap_polygon`), not the
+HPatches-convention four-image-corner reprojection.  Numbers are therefore
+NOT directly comparable to published image-matching tables — see
+project_overview.md §Stage 7 for the rationale.
+
+mAA-OP is computed from the per-pair ``{attempt}_err`` columns in the CSV,
+not from the ordinal result labels.
 
 For each configured accuracy tier threshold T (default 3, 5, 10 px):
 
@@ -22,7 +30,7 @@ For each configured accuracy tier threshold T (default 3, 5, 10 px):
 
 where recall(ε) is the fraction of pairs whose corner error ≤ ε.  The
 integral is evaluated exactly via the trapezoidal rule on the sorted error
-values.  mAA = mean(AUC@T₁, AUC@T₂, …).
+values.  mAA-OP = mean(AUC@T₁, AUC@T₂, …).
 
 Failures (no transform produced → NaN corner error) are mapped to infinite
 error before sorting.  They count in the recall denominator but never reach
@@ -63,6 +71,25 @@ def _matplotlib_pyplot():
 def _precision_cmap():
     from matplotlib.colors import LinearSegmentedColormap
     return LinearSegmentedColormap.from_list("rwg", ["red", "white", "green"])
+
+
+def _pcr_cmap():
+    """Diverging colormap red → white → magenta for the PCR matrices.
+    Used with a linear ``Normalize(0, 1)``, so white sits at exactly 0.5
+    (the fixed midpoint of the metric's bounded range)."""
+    from matplotlib.colors import LinearSegmentedColormap
+    return LinearSegmentedColormap.from_list("rwm", ["red", "white", "magenta"])
+
+
+def _match_rate_cmap():
+    """Diverging colormap red → white → azure (dodgerblue) for the
+    match-rate matrices.  Used with a linear ``Normalize(0, 1)``, so
+    white sits at exactly 0.5."""
+    from matplotlib.colors import LinearSegmentedColormap
+    # "azure" in CSS is near-white (#F0FFFF); use a saturated azure-blue
+    # so the high end of the colormap is visually distinct from the white
+    # midpoint.
+    return LinearSegmentedColormap.from_list("rwa", ["red", "white", "dodgerblue"])
 
 
 _MAA_CMAP_NAME = "bwr_r"   # matplotlib built-in: red-white-blue
@@ -158,10 +185,13 @@ def _cumulative_acc_rate(series: pd.Series, threshold: float) -> float:
 
 
 def _maa(errors: pd.Series, tiers: list[float]) -> float:
-    """Mean Average Accuracy (standard AUC form, matching SuperGlue / glue-factory).
+    """mean Average Accuracy on the Overlap Polygon (mAA-OP).
 
-    For each tier threshold T, computes AUC@T — the area under the
-    recall-vs-error curve from 0 to T, normalised by T.  mAA is the mean
+    Same AUC aggregation as SuperGlue / glue-factory mAA, but the underlying
+    per-pair error is the mean per-vertex distance on the clipped overlap
+    polygon (not the HPatches-convention four-image-corner error).  For
+    each tier threshold T, computes AUC@T — the area under the
+    recall-vs-error curve from 0 to T, normalised by T.  mAA-OP is the mean
     of these per-threshold AUC values.
 
     Failures (NaN error — no transform produced) map to infinite error:
@@ -191,14 +221,18 @@ def _best_of_both(no_mask: pd.Series, with_mask: pd.Series) -> pd.Series:
     """Per row, pick the label of the better attempt.
 
     Ordering (best → worst): smallest tier value (best) > larger tier values >
-    ``"false_match"`` > ``"no_match"``.  Useful for answering "what would a
-    fallback policy that picks the better of the two attempts achieve?".
+    ``"no_match"`` > ``"false_match"``.  ``no_match`` ranks above
+    ``"false_match"`` because ``no_match`` is neutral for Precision (excluded
+    from both numerator and denominator), whereas ``false_match`` is an
+    incorrect emission that actively lowers Precision.  For mAA-OP both
+    contribute zero AUC at the standard tier sizes (> 10 px error / inf), so
+    this ordering has no effect on mAA-OP.
     """
     def rank(label) -> tuple[int, float]:
         if pd.isna(label) or label == "no_match":
             return (3, 0.0)
         if label == "false_match":
-            return (2, 0.0)
+            return (3, 1.0)   # worse than no_match for Precision; same for mAA-OP
         t = _parse_tier(label)
         if t is None:
             return (3, 0.0)
@@ -251,10 +285,25 @@ def _error_col(attempt: str) -> str:
     return f"{attempt}_err"
 
 
+def _pcr_col(attempt: str) -> str:
+    return f"{attempt}_pixel_correspondence_rate"
+
+
+def _match_rate(label_series: pd.Series) -> float:
+    """Fraction of rows whose label is **anything other than** ``no_match`` —
+    i.e. the share of pairs for which the pipeline produced some transform,
+    whether or not that transform was accurate.  ``acc_at_*`` and
+    ``false_match`` both count as 'a transform was produced'.  Returns 0 on
+    an empty series."""
+    if label_series.empty:
+        return 0.0
+    return float((label_series != "no_match").mean())
+
+
 def _add_best_of_both_err_column(df: pd.DataFrame) -> pd.DataFrame:
     """Add ``best_of_both_err``: the corner error of whichever attempt
     ``_best_of_both`` selected per row.  Mirrors the label-picking logic so
-    AUC-based mAA for best_of_both uses the same attempt that won the label."""
+    AUC-based mAA-OP for best_of_both uses the same attempt that won the label."""
     if "best_of_both_err" in df.columns:
         return df
     needed = {"no_mask_err", "with_mask_err", "no_mask_result", "with_mask_result"}
@@ -266,7 +315,7 @@ def _add_best_of_both_err_column(df: pd.DataFrame) -> pd.DataFrame:
         if pd.isna(label) or label == "no_match":
             return (3, 0.0)
         if label == "false_match":
-            return (2, 0.0)
+            return (3, 1.0)
         t = _parse_tier(label)
         return (1, t) if t is not None else (3, 0.0)
 
@@ -281,6 +330,43 @@ def _add_best_of_both_err_column(df: pd.DataFrame) -> pd.DataFrame:
         else:
             errs.append(df["with_mask_err"].iat[i])
     df["best_of_both_err"] = errs
+    return df
+
+
+def _add_best_of_both_pcr_column(df: pd.DataFrame) -> pd.DataFrame:
+    """Add ``best_of_both_pixel_correspondence_rate``: the PCR of whichever
+    attempt won the ``best_of_both`` label per row.  Mirrors
+    :func:`_add_best_of_both_err_column` so the PCR matrix for best_of_both
+    uses the same attempt that won the label."""
+    out_col = "best_of_both_pixel_correspondence_rate"
+    if out_col in df.columns:
+        return df
+    no_mask_pcr = "no_mask_pixel_correspondence_rate"
+    with_mask_pcr = "with_mask_pixel_correspondence_rate"
+    needed = {no_mask_pcr, with_mask_pcr, "no_mask_result", "with_mask_result"}
+    if not needed.issubset(df.columns):
+        df[out_col] = pd.NA
+        return df
+
+    def _rank(label) -> tuple[int, float]:
+        if pd.isna(label) or label == "no_match":
+            return (3, 0.0)
+        if label == "false_match":
+            return (3, 1.0)
+        t = _parse_tier(label)
+        return (1, t) if t is not None else (3, 0.0)
+
+    vals = []
+    for i in range(len(df)):
+        nm_res = df["no_mask_result"].iat[i]
+        wm_res = df["with_mask_result"].iat[i]
+        if pd.isna(nm_res) or pd.isna(wm_res):
+            vals.append(float("nan"))
+        elif _rank(nm_res) <= _rank(wm_res):
+            vals.append(df[no_mask_pcr].iat[i])
+        else:
+            vals.append(df[with_mask_pcr].iat[i])
+    df[out_col] = vals
     return df
 
 
@@ -336,7 +422,7 @@ def _render_overall(df: pd.DataFrame, estimators: list[str],
         f"Accuracy tiers (px): **{', '.join(f'{t:g}' for t in tiers)}**.\n"
     )
 
-    headers = ["Estimator", "Attempt", "Pairs", "mAA", "Precision",
+    headers = ["Estimator", "Attempt", "Pairs", "mAA-OP", "Precision",
                *(f"acc@{t:g}" for t in tiers),
                "false_match", "no_match"]
     out.append("| " + " | ".join(headers) + " |")
@@ -372,7 +458,7 @@ def _render_overall(df: pd.DataFrame, estimators: list[str],
 def _per_config_summary(df: pd.DataFrame, estimator: str,
                         tiers: list[float]) -> pd.DataFrame:
     """One row per (detector, descriptor) within a fixed estimator, columns
-    summarising each of the three attempts (mAA, per-tier rates, false/no)."""
+    summarising each of the three attempts (mAA-OP, per-tier rates, false/no)."""
     sub = df[df["estimator"] == estimator]
     if sub.empty:
         return pd.DataFrame()
@@ -408,7 +494,7 @@ def _render_scoreboard_block(df: pd.DataFrame, estimator: str,
     per_cfg = _per_config_summary(df, estimator, tiers)
     if per_cfg.empty:
         return []
-    # Sort by best_of_both mAA when available, else with_mask, else no_mask.
+    # Sort by best_of_both mAA-OP when available, else with_mask, else no_mask.
     for key in ("maa_best_of_both", "maa_with_mask", "maa_no_mask"):
         if key in per_cfg.columns:
             per_cfg = per_cfg.sort_values(key, ascending=False, na_position="last")
@@ -419,7 +505,7 @@ def _render_scoreboard_block(df: pd.DataFrame, estimator: str,
 
     def header_label(stat: str) -> str:
         if stat == "maa":
-            return "mAA"
+            return "mAA-OP"
         if stat == "precision":
             return "Prec"
         if stat.startswith("acc_at_"):
@@ -438,7 +524,7 @@ def _render_scoreboard_block(df: pd.DataFrame, estimator: str,
     header_cells.extend(h for _, h in cols)
 
     out = [f"\n### {estimator}\n",
-           f"Sorted by mAA<sub>{sort_label}</sub> (descending). "
+           f"Sorted by mAA-OP<sub>{sort_label}</sub> (descending). "
            f"{len(per_cfg)} detector+descriptor combinations.\n"]
     out.append("| " + " | ".join(header_cells) + " |")
     out.append("|" + "---|" * len(header_cells))
@@ -455,20 +541,20 @@ def _render_scoreboards(df: pd.DataFrame, estimators: list[str],
                         tiers: list[float]) -> list[str]:
     out = ["\n## Per-configuration scoreboard"]
     out.append("One table per estimator. Configurations are detector+descriptor; "
-               "each attempt gets its own mAA / acc@T / false_match / no_match columns.\n")
+               "each attempt gets its own mAA-OP / acc@T / false_match / no_match columns.\n")
     for est in estimators:
         out.extend(_render_scoreboard_block(df, est, tiers))
     return out
 
 
-# ---------- Section: detector × descriptor mAA matrices ----------
+# ---------- Section: detector × descriptor mAA-OP matrices ----------
 
 
 def _metric_matrix(df: pd.DataFrame, estimator: str, attempt: str,
                    metric: str, tiers: list[float]) -> pd.DataFrame:
     """Wide DataFrame: index=detector, columns=descriptor, values=<metric>.
 
-    ``metric`` is either ``"maa"`` or ``"precision"``.
+    ``metric`` is one of ``"maa"``, ``"precision"``, ``"pcr"``, ``"match_rate"``.
     """
     col = _attempt_col(attempt)
     if col not in df.columns:
@@ -477,6 +563,7 @@ def _metric_matrix(df: pd.DataFrame, estimator: str, attempt: str,
     if sub.empty:
         return pd.DataFrame()
     ecol = _error_col(attempt)
+    pcr_col = _pcr_col(attempt)
     rows = []
     for (det, desc), group in sub.groupby(["detector", "descriptor"], sort=False):
         label_s = group[col].dropna()
@@ -487,6 +574,14 @@ def _metric_matrix(df: pd.DataFrame, estimator: str, attempt: str,
             value = _maa(err_s, tiers)
         elif metric == "precision":
             value = _precision(label_s)
+        elif metric == "pcr":
+            if pcr_col in group.columns:
+                pcr_s = pd.to_numeric(group[pcr_col], errors="coerce").dropna()
+                value = float(pcr_s.mean()) if not pcr_s.empty else float("nan")
+            else:
+                value = float("nan")
+        elif metric == "match_rate":
+            value = _match_rate(label_s)
         else:
             raise ValueError(f"Unknown metric: {metric!r}")
         rows.append({"detector": det, "descriptor": desc, "value": value})
@@ -518,21 +613,30 @@ def _order_by_average(table: pd.DataFrame) -> pd.DataFrame:
 
 
 def _save_heatmap(table: pd.DataFrame, path: Path, *, title: str,
-                  cmap, vmin: float = 0.0, vmax: float = 1.0) -> None:
+                  cmap, vmin: float = 0.0, vmax: float = 1.0,
+                  norm=None) -> None:
     """Render a heatmap with annotated cell values and save to ``path``.
 
-    Cell text colour adapts to the underlying value — extreme-end values
+    Cell text colour adapts to the underlying value — extreme-end cells
     (where the colormap is darkest) get white text; mid-range cells get
-    black text — keeps annotations legible on both diverging palettes.
+    black text — keeps annotations legible on both linear and
+    median-centred (``TwoSlopeNorm``) palettes.
+
+    Pass ``norm`` to use a non-linear normalisation (e.g.
+    ``TwoSlopeNorm`` for median-centred diverging colormaps); when
+    ``norm`` is given, ``vmin`` / ``vmax`` are ignored.
     """
     if table.empty:
         return
     plt = _matplotlib_pyplot()
+    from matplotlib.colors import Normalize
+    if norm is None:
+        norm = Normalize(vmin=vmin, vmax=vmax)
     n_rows, n_cols = table.shape
     fig, ax = plt.subplots(
         figsize=(max(6, n_cols * 0.95 + 1.5), max(4, n_rows * 0.55 + 1.0))
     )
-    im = ax.imshow(table.values, cmap=cmap, vmin=vmin, vmax=vmax, aspect="auto")
+    im = ax.imshow(table.values, cmap=cmap, norm=norm, aspect="auto")
     ax.set_xticks(range(n_cols))
     ax.set_xticklabels(table.columns, rotation=45, ha="right")
     ax.set_yticks(range(n_rows))
@@ -544,8 +648,10 @@ def _save_heatmap(table: pd.DataFrame, path: Path, *, title: str,
                 ax.text(j, i, "—", ha="center", va="center",
                         color="black", fontsize=8)
                 continue
-            # Use white text on dark extremes, black near the colormap centre.
-            text_color = "white" if abs(v - (vmin + vmax) / 2) > 0.35 * (vmax - vmin) else "black"
+            # Normalised position in the colormap (0 = low extreme, 1 = high).
+            # White text on dark extremes; black text near the centre (0.5).
+            nv = float(norm(v))
+            text_color = "white" if abs(nv - 0.5) > 0.35 else "black"
             ax.text(j, i, f"{v:.2f}", ha="center", va="center",
                     color=text_color, fontsize=8)
     fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
@@ -565,9 +671,10 @@ def _section_vmax(tables: list[pd.DataFrame], metric: str) -> float:
     """Pick a single ``vmax`` for every heatmap in one section so they stay
     visually comparable.
 
-    * Precision: always ``1.0`` — the metric is bounded in ``[0, 1]`` and
-      typically saturates near the top.
-    * mAA (AUC form): use the observed max across all tables, rounded up to
+    * Precision, PCR, match_rate: always ``1.0`` — these metrics are
+      bounded in ``[0, 1]`` and typically span enough of the range that
+      a fixed top makes panels comparable.
+    * mAA-OP (AUC form): use the observed max across all tables, rounded up to
       the next 0.1 and floored at ``0.3``.  Floor prevents three near-zero
       tables from amplifying noise; rounding keeps the colorbar tidy.
       NaN cells (sparse tables) are ignored — without nan-aware reduction
@@ -591,20 +698,39 @@ def _section_vmax(tables: list[pd.DataFrame], metric: str) -> float:
 def _render_matrices_section(df: pd.DataFrame, estimators: list[str],
                              tiers: list[float], metric: str,
                              output_dir: Path) -> list[str]:
-    """One unified renderer for both mAA and Precision matrix sections.
+    """One unified renderer for all four matrix sections (mAA-OP, Precision,
+    PCR, match_rate).
 
     Writes one heatmap PNG per (estimator × attempt) into ``output_dir`` and
     emits markdown that embeds each PNG followed by the same data as a table
     (table uses the same row/column ordering, so the heatmap and the lookup
     table line up cell-for-cell).
 
-    All heatmaps in the section share a single colour scale (see
-    :func:`_section_vmax`) so the eye can compare cells across the grid.
+    All heatmaps in a section share a single linear colour scale `[0, vmax]`
+    (vmax via :func:`_section_vmax`).  Diverging colormaps put white at the
+    midpoint of that range — for the bounded `[0, 1]` metrics (Precision,
+    PCR, match_rate) that means white sits at exactly 0.5.
     """
-    pretty_metric = "mAA" if metric == "maa" else "Precision"
-    cmap = _MAA_CMAP_NAME if metric == "maa" else _precision_cmap()
+    if metric == "maa":
+        pretty_metric = "mAA-OP"
+        cmap = _MAA_CMAP_NAME
+        colour_desc = "red (low) → white → blue (high)"
+    elif metric == "precision":
+        pretty_metric = "Precision"
+        cmap = _precision_cmap()
+        colour_desc = "red (0) → white (0.5) → green (1)"
+    elif metric == "pcr":
+        pretty_metric = "PCR"
+        cmap = _pcr_cmap()
+        colour_desc = "red (0) → white (0.5) → magenta (1)"
+    elif metric == "match_rate":
+        pretty_metric = "Match rate"
+        cmap = _match_rate_cmap()
+        colour_desc = "red (0) → white (0.5) → azure (1)"
+    else:
+        raise ValueError(f"Unknown matrix metric: {metric!r}")
 
-    # Pass 1: collect all the ordered tables so we can pick a shared vmax.
+    # Pass 1: collect all the ordered tables so we can pick a shared scale.
     populated: list[tuple[str, str, pd.DataFrame]] = []
     for est in estimators:
         for attempt in _ATTEMPTS:
@@ -623,10 +749,7 @@ def _render_matrices_section(df: pd.DataFrame, estimators: list[str],
         f"One heatmap per (estimator × attempt). Rows/columns are sorted by "
         f"descending mean {pretty_metric}, so the strongest detectors sit at "
         f"the top and the strongest descriptors at the left. "
-        + ("Colour: red (low) → white → blue (high)."
-           if metric == "maa"
-           else "Colour: red (low) → white → green (high).")
-        + f" Colour scale: 0.0 → {vmax:.1f}.\n"
+        f"Colour: {colour_desc}. Colour scale: 0.0 → {vmax:.1f}.\n"
     )
 
     # Pass 2: render each table against the shared scale.
@@ -691,7 +814,7 @@ def _render_fallback_benefit(df: pd.DataFrame, estimators: list[str],
                              tiers: list[float]) -> list[str]:
     out = ["\n## Fallback benefit (best_of_both vs. single attempt)"]
     out.append(
-        "For each detector+descriptor combo, how much would mAA improve if "
+        "For each detector+descriptor combo, how much would mAA-OP improve if "
         "the policy ran `mask_mode = both` and kept the better of the two "
         "attempts per pair? Δ < 0 means a single attempt is already as good "
         "as the picker. One table per estimator.\n"
@@ -703,8 +826,8 @@ def _render_fallback_benefit(df: pd.DataFrame, estimators: list[str],
             continue
         any_table = True
         out.append(f"\n### {est}\n")
-        out.append("| Configuration | mAA<sub>no_mask</sub> | mAA<sub>with_mask</sub> "
-                   "| mAA<sub>best</sub> | Δ vs. no_mask | Δ vs. with_mask |")
+        out.append("| Configuration | mAA-OP<sub>no_mask</sub> | mAA-OP<sub>with_mask</sub> "
+                   "| mAA-OP<sub>best</sub> | Δ vs. no_mask | Δ vs. with_mask |")
         out.append("|---|---|---|---|---|---|")
         for _, row in table.iterrows():
             def fmt(v):
@@ -730,22 +853,30 @@ def write_summary_report(csv_path: Path, output_dir: Path) -> None:
 
     Sections:
 
-    * **Overall** — single cross-table over (estimator × attempt) of mAA,
+    * **Overall** — single cross-table over (estimator × attempt) of mAA-OP,
       Precision, per-tier accuracy rates, and false/no_match shares.
     * **Per-configuration scoreboard** — one table per estimator. Rows are
-      detector+descriptor combos; columns are per-attempt mAA, Precision,
+      detector+descriptor combos; columns are per-attempt mAA-OP, Precision,
       acc@T, false_match, no_match.
-    * **mAA matrices** — heatmap PNG + numeric table per (estimator × attempt),
+    * **mAA-OP matrices** — heatmap PNG + numeric table per (estimator × attempt),
       up to 6 of each. Detectors (rows) and descriptors (columns) sorted by
-      descending mean mAA. Colour: red (low) → white → blue (high), shared
+      descending mean mAA-OP. Colour: red (low) → white → blue (high), shared
       scale across the section (see :func:`_section_vmax`).
-    * **Precision matrices** — same layout as mAA matrices but coloured
+    * **Precision matrices** — same layout as mAA-OP matrices but coloured
       red (low) → white → green (high).
+    * **PCR matrices** — same layout, aggregating per-pair
+      ``pixel_correspondence_rate`` by mean within each (detector,
+      descriptor) cell. Colour: red (0) → white (0.5) → magenta (1),
+      linear ``Normalize(0, 1)``.
+    * **Match-rate matrices** — same layout, cell value = fraction of pairs
+      whose result is anything other than ``no_match`` (i.e. the pipeline
+      produced *some* transform, accurate or not). Colour: red (0) →
+      white (0.5) → azure (1), linear ``Normalize(0, 1)``.
     * **Fallback benefit** — one table per estimator. Per detector+descriptor
       combo, lift of the best_of_both policy over each single attempt.
 
     Heatmap PNGs are saved alongside ``report.md`` as
-    ``heatmap_{maa|precision}_{estimator}_{attempt}.png``.
+    ``heatmap_{maa|precision|pcr|match_rate}_{estimator}_{attempt}.png``.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     if not csv_path.exists():
@@ -754,6 +885,7 @@ def write_summary_report(csv_path: Path, output_dir: Path) -> None:
     df = pd.read_csv(csv_path)
     df = _add_best_of_both_column(df)
     df = _add_best_of_both_err_column(df)
+    df = _add_best_of_both_pcr_column(df)
 
     # Discover the accuracy tiers present anywhere in the data.
     tiers: list[float] = []
@@ -771,6 +903,8 @@ def write_summary_report(csv_path: Path, output_dir: Path) -> None:
     report.extend(_render_scoreboards(df, estimators, tiers))
     report.extend(_render_matrices_section(df, estimators, tiers, "maa", output_dir))
     report.extend(_render_matrices_section(df, estimators, tiers, "precision", output_dir))
+    report.extend(_render_matrices_section(df, estimators, tiers, "pcr", output_dir))
+    report.extend(_render_matrices_section(df, estimators, tiers, "match_rate", output_dir))
     report.extend(_render_fallback_benefit(df, estimators, tiers))
 
     with open(output_dir / "report.md", "w", encoding="utf-8") as f:

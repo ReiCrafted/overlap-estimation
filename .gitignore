@@ -13,6 +13,7 @@ ENV/
 # Project Specific
 Images/
 results/
+mask_test_output/
 
 # IDEs
 .vscode/
