@@ -3,7 +3,7 @@
 Comparative evaluation framework for feature-based image-pair overlap
 detection. Sweeps a full matrix of detectors × descriptors × estimators ×
 mask modes over a labelled image dataset and reports per-configuration
-accuracy, IoU, mAA, and runtime.
+accuracy, pixel-correspondence rate, mAA-OP, and runtime.
 
 ## Quick start
 
@@ -35,8 +35,9 @@ preprocess (mask) → detect → describe → match → verify (RANSAC) →
 11 detectors, 9 descriptors, every pairing is valid (custom NumPy fallbacks
 for LIOP and MLDB make this work). Robust verification via PROSAC or
 USAC_MAGSAC, gated only by `RunConfig.min_inliers`; metrics produce an
-ordinal `result_label` per the configured accuracy tiers, plus IoU and the
-standard AUC-form mAA in reporting.
+ordinal `result_label` per the configured accuracy tiers, plus a per-pixel
+correspondence rate (PCR) and the AUC-form **mAA-OP** ("mean Average
+Accuracy on the Overlap Polygon") in reporting.
 
 For full architecture, data contracts, custom descriptor algorithms, and
 the quality-gate semantics see [project_overview.md](project_overview.md).

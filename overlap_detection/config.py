@@ -23,7 +23,6 @@ Pairing rules (derived from OpenCV / contrib constraints)
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # Supported algorithm identifiers
@@ -107,16 +106,28 @@ class RunConfig:
     mask_mode: str = "both"
     """Masking strategy: ``"no_mask"`` | ``"mask"`` | ``"both"``.
 
-    * ``no_mask`` — process full images.
-    * ``mask``    — apply greenness / tray mask.
+    * ``no_mask`` — only band mask.
+    * ``mask``    — band mask and tray mask.
     * ``both``    — run the pair twice (once with each mode) and emit a
       single CSV row whose ``no_mask_*`` and ``with_mask_*`` columns are
       both populated.  Per-attempt JSON files are still written separately.
     """
 
-    rgb_gray_threshold: int = 15
-    """Pixels with ``max(R,G,B) - min(R,G,B) < rgb_gray_threshold`` are
-    classified as achromatic (grey) and excluded from the greenness mask."""
+    mask_sat_threshold: float = 0.12
+    """Saturation threshold for the cassette-frame mask.  Pixels whose
+    relative saturation ``(max(R,G,B) - min(R,G,B)) / max(R,G,B)`` is
+    **below** this value are candidates for exclusion (low-chroma plastic
+    frame).  Combined with the brightness band below."""
+
+    mask_brightness_lo: int = 15
+    """Lower bound on ``max(R,G,B)`` for the frame band.  A pixel is treated
+    as cassette frame only if its brightness is **at or above** this value
+    (avoids masking out very dark plant/soil content)."""
+
+    mask_brightness_hi: int = 180
+    """Upper bound on ``max(R,G,B)`` for the frame band.  A pixel is treated
+    as cassette frame only if its brightness is **at or below** this value
+    (avoids masking out bright highlights)."""
 
     overlap_band_fraction: float = 0.20
     """Fraction of the image width retained on each edge as the candidate
@@ -151,7 +162,7 @@ class RunConfig:
     """Algorithm-specific constructor overrides forwarded to the OpenCV
     descriptor factory."""
 
-    descriptor_default_sigma: float = 6.0
+    descriptor_default_sigma: float = 4.0
     """Fallback scale (pixels) injected into keypoints whose detector does not
     provide a ``sigma`` value.  Used by scale-dependent descriptors such as
     DAISY, SIFT, LIOP."""
@@ -164,7 +175,7 @@ class RunConfig:
     """Match filtering strategy: ``"mnn"`` (Mutual Nearest Neighbours) or
     ``"mnn_nndr"`` (MNN + Nearest Neighbour Distance Ratio test)."""
 
-    nndr_threshold: float = 0.90
+    nndr_threshold: float = 0.80
     """Lowe-ratio threshold for the NNDR filter.  A match is kept when
     ``d1 / d2 < nndr_threshold``."""
 
@@ -194,23 +205,20 @@ class RunConfig:
     estimate that fails this gate (or whose underlying RANSAC call returned
     no transform) yields the ``"no_match"`` categorical result."""
 
+    pixel_correspondence_tolerance_px: float = 5.0
+    """Per-pixel error budget (B-pixels) for the pixel-correspondence-rate
+    metric.  A pixel inside the GT overlap region is counted as correctly
+    placed when ``||M_est @ p − M_gt @ p|| ≤`` this value.  Default 1.0 —
+    sub-pixel alignment.  Lower → stricter; higher → more forgiving."""
+
     accuracy_tiers_px: tuple[float, ...] = (3.0, 5.0, 10.0)
-    """Corner-RMS thresholds (px) that define the ordinal accuracy tiers
-    used to label each attempt's ``*_result`` column.  Sorted ascending at
-    use time.  A pair whose corner RMS is ≤ the smallest tier is labelled
-    ``"acc_at_<smallest>"``; if greater than the largest tier it is labelled
-    ``"false_match"``; if no transform was produced it is ``"no_match"``."""
+    """Mean-corner-error thresholds (px, B-frame) that define the ordinal
+    accuracy tiers used to label each attempt's ``*_result`` column.  Error
+    is the mean per-vertex distance between the estimated and ground-truth
+    *clipped overlap polygons* in B's frame (vertex count 3–8, usually 3–5
+    in practice).  Sorted ascending at use time.  A pair whose mean corner
+    error is ≤ the smallest tier is labelled ``"acc_at_<smallest>"``; if
+    greater than the largest tier it is labelled ``"false_match"``; if no
+    transform was produced (or polygons have mismatched vertex counts / are
+    empty) it is ``"no_match"``."""
 
-    # ------------------------------------------------------------------
-    # I/O
-    # ------------------------------------------------------------------
-
-    output_dir: Path = Path("./results")
-    """Root directory for all pipeline outputs (JSON, CSV, plots)."""
-
-    save_intermediate: bool = False
-    """When ``True``, persist intermediate artefacts (masked images, match
-    visualisations) inside ``output_dir``."""
-
-    random_seed: int = 42
-    """Global RNG seed for reproducible RANSAC / PROSAC sampling."""

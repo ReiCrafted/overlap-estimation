@@ -13,7 +13,7 @@ Overlap_Estimation/
 │   ├── __init__.py            # Public-API re-exports
 │   ├── config.py              # RunConfig, VALID_MASK_MODES, VALID_ESTIMATORS
 │   ├── types.py               # Shared dataclasses (Keypoint, PairResult, GroundTruth)
-│   ├── preprocessing.py       # Masking (overlap band + greenness/grayness)
+│   ├── preprocessing.py       # Masking (overlap band + saturation/brightness frame exclusion)
 │   ├── detection.py           # OpenCV feature detector wrappers
 │   ├── description.py         # Descriptor dispatch; routes LIOP/MLDB to custom impls
 │   ├── liop.py                # Custom NumPy LIOP descriptor (144-dim float32)
@@ -21,11 +21,11 @@ Overlap_Estimation/
 │   ├── matching.py            # Keypoint matching (BFMatcher, NNDR, MNN)
 │   ├── verification.py        # Robust affine estimation (PROSAC / USAC_MAGSAC)
 │   ├── geometry.py            # Overlap-polygon computation from affine
-│   ├── metrics.py             # IoU, mean corner error, result categorisation
+│   ├── metrics.py             # mean corner error, pixel correspondence rate, result categorisation
 │   ├── reporting.py           # JSON/CSV writers + markdown summary report
 │   ├── orchestrator.py        # Pipeline runner + experiment matrix (multi-core)
 │   ├── auto_aligner.py        # Background auto-alignment for the annotation GUI
-│   └── annotation_gui.py      # Standalone Tkinter ground-truth labelling GUI
+│   └── annotation_gui.py      # Standalone OpenCV ground-truth labelling GUI
 ├── tests/                     # Pytest suite (per-module)
 ├── scripts/                   # CLI entrypoints
 │   ├── run_experiment.py      # Runs the experimental matrix
@@ -41,20 +41,23 @@ The overlap detection system is built around a multi-stage sequential pipeline m
 
 1. **Stage 1: Preprocessing & Masking** (`preprocessing.py`)
    - Inputs: Images A and B.
-   - Outputs: Binary masks isolating regions of interest using RGB-channel-range thresholding combined with an overlap-band mask along the gantry motion axis.
+   - Outputs: Binary masks isolating regions of interest by combining an overlap-band mask along the gantry motion axis with a saturation+brightness mask that excludes the plastic cassette frame.
    - **Primitive masks:**
      - `make_overlap_band_mask(image_shape, band_fraction, side)` — sets a vertical strip of width `int(W * band_fraction)` on each requested edge to `255`, the rest to `0`. `side ∈ {"left", "right", "both"}`, default `"both"`. Top and bottom edges are never masked (motion is horizontal).
-     - `make_grayness_mask(image, gray_threshold)` — `255` where `np.ptp(rgb, axis=2) > gray_threshold`, `0` elsewhere. Operates on uint8 RGB; classifies a pixel as achromatic when its per-channel range is small.
+     - `make_saturation_brightness_mask(image, sat_threshold=0.12, brightness_lo=15, brightness_hi=180)` — `0` where the pixel matches the cassette-frame signature, `255` elsewhere. A pixel is treated as **frame** iff both: (i) relative saturation `(max(R,G,B) - min(R,G,B)) / max(R,G,B) < sat_threshold` (low chroma), AND (ii) `brightness_lo ≤ max(R,G,B) ≤ brightness_hi` (mid-range brightness band). Operates on uint8 RGB; the divide is guarded against `max == 0` so all-black pixels get `sat = 0` (then kept because they fall below `brightness_lo`).
      - `combine_masks(*masks)` — bitwise AND of all inputs; raises `ValueError` if no masks provided.
-   - **Composite per attempt mode** (`apply_mask_mode(image, mode, band_fraction, gray_threshold, side)`):
+   - **Why this mask shape.** Empirical CSV analysis of frame vs. content pixels (see `30_800_1751035437_grey.csv` / `_nongrey.csv` in the dataset) shows frame pixels cluster tightly at sat ≈ 0.05 in a brightness band, while plant/soil content is either much darker (median brightness 27), much brighter (highlights), or significantly chromatic (mean R-B = +16, warm tones). A relative-saturation test plus brightness bracketing separates the two populations far more cleanly than an absolute channel-range threshold does — the older `max-min ≤ T` rule conflated dark soil and grey plastic, since both have small absolute channel range despite very different chroma. Empirical thresholds tuned on the `no_green` dataset are `sat < 0.12 AND 15 ≤ brightness ≤ 180`. The brightness floor of 15 deliberately keeps dark content (the soil/plant interior is near-black) inside the mask; the ceiling of 180 keeps bright highlights inside the mask.
+   - **Composite per attempt mode** (`apply_mask_mode(image, mode, band_fraction, side, sat_threshold, brightness_lo, brightness_hi)`):
      | `mode`        | Returned mask                                |
      |---------------|----------------------------------------------|
      | `"no_mask"`   | band mask only                               |
-     | `"mask"`      | band mask ∧ grayness mask                    |
+     | `"mask"`      | band mask ∧ saturation/brightness frame mask |
      | `"fallback"`  | same as `"no_mask"` (legacy alias)           |
      - Any other value → `ValueError(f"Unknown mask mode: {mode}")`.
+     - The three saturation/brightness keyword arguments default to the values above; the orchestrator forwards `RunConfig.mask_sat_threshold`, `RunConfig.mask_brightness_lo`, and `RunConfig.mask_brightness_hi`.
    - **Orchestrator usage of `side`:** image A always receives `side="right"` (its right edge overlaps B) and image B always receives `side="left"`. Hard-coded in `_execute_pipeline`; not exposed in `RunConfig`.
    - The user-facing `RunConfig.mask_mode = "both"` is **scheduling-only** and does not reach this stage — the orchestrator expands it into one `"no_mask"` invocation and one `"mask"` invocation per pair (see Stage 8).
+   - **Known limitation.** The dark plastic dividers between individual cassette wells (brightness ≪ 15, low saturation) are *not* caught by this mask — they fall below `brightness_lo` because plant/soil content is equally dark. Pixel-level RGB filtering cannot separate dark frame from dark content; if the dark grid becomes a feature-noise problem, a structural/morphological filter would have to be layered on top.
 
 2. **Stage 2: Detection** (`detection.py`)
    - Inputs: Preprocessed image (uint8 RGB; internally converted to grayscale) and the mask from Stage 1.
@@ -152,14 +155,15 @@ The overlap detection system is built around a multi-stage sequential pipeline m
    - **Degenerate-affine guard.** Before inverting, `invert_affine` is wrapped in `try/except np.linalg.LinAlgError`. A singular 2×2 sub-matrix (zero/near-zero scale, collinear axes) silently returns `(empty, empty)` so the metrics stage can still grade the attempt as `no_match` without crashing.
    - **Empty / non-polygon intersection** (`is_empty` or geometry type outside `{Polygon, MultiPolygon}`) → `(empty, empty)`.
    - **MultiPolygon intersection** → the component with the largest area is kept; the rest are discarded.
-   - **Helpers.** `apply_affine(points, M)` does the homogeneous-coords multiply and returns `(N, 2)`; `invert_affine(M)` analytically inverts the 2×2 sub-matrix and propagates the translation. Both are exported and reused by `metrics.corner_errors_hpatches` and the annotation GUI.
+   - **Helpers.** `apply_affine(points, M)` does the homogeneous-coords multiply and returns `(N, 2)`; `invert_affine(M)` analytically inverts the 2×2 sub-matrix and propagates the translation. Both are exported and reused by `metrics.corner_errors_overlap_polygon` and the annotation GUI.
 
 7. **Stage 7: Metrics & Categorisation** (`metrics.py`)
    - Inputs: `PairResult` (timings, counts, affine, polygons) and `GroundTruth`.
-   - Outputs: per-stage timings, keypoint/match/inlier counts, IoU vs. ground truth, **mean corner error** (HPatches convention — see below), and the **ordinal `result_label`** assigned by `categorize_result`.
-   - **Error metric (HPatches convention).** `corner_errors_hpatches` warps image-A's **four unclipped image-rectangle corners** (in order TL, TR, BR, BL) through both the estimated and the ground-truth affines, then takes the Euclidean distance between the two sets — measured in **B-pixels**. Always 4 corners, no polygon clipping; projected corners are allowed to land outside B's image rectangle. This matches what SuperGlue / glue-factory / LoFTR report, so the numbers and the AUC-form mAA derived from them are directly comparable to published tables.
-   - **Why decoupled from IoU.** IoU still uses the *clipped* overlap polygon (since IoU is fundamentally an area metric and needs the actually-overlapping region). Corner error doesn't need a polygon at all — it's a pure 4-point reprojection check. Decoupling them removed a pre-existing edge case where vertex-count mismatches between estimated and GT overlap polygons would silently downgrade a successful pair to `no_match`.
-   - mAA is then computed in the standard AUC form by the **reporting** stage (see §Metric definitions) — `metrics.py` only emits the raw `mean_corner_error` and the ordinal label; `reporting.py` derives mAA / Precision / acc@T / matrices from the CSV.
+   - Outputs: per-stage timings, keypoint/match/inlier counts, **mean corner error** (per-vertex distance on the clipped overlap polygon — see below), **pixel correspondence rate** (per-pixel transform-agreement on the overlap region), and the **ordinal `result_label`** assigned by `categorize_result`.
+   - **Error metric (clipped overlap polygon).** `corner_errors_overlap_polygon` computes the overlap polygon in B's frame for *both* the estimated and the ground-truth affines (each is A's warped rectangle ∩ B's image rectangle, canonicalised clockwise / top-left-first), then returns the Euclidean distance between corresponding vertices in B-pixels.  Vertex count is **3–8** depending on how A's warped rectangle clips against B (in practice usually 3–5 on this dataset).  This is operationally meaningful: it grades the affine over the region where features can actually be matched, instead of extrapolating to image corners that may sit far outside the overlap — where small rotational errors get amplified into large pixel deviations (a 0.5° rotation on a 2464×2056 image produces ≈21 px at the image corner but only a few px at the overlap polygon edge).
+   - **Known ungradable case.** If the estimated and GT polygons clip against different sides of B and end up with different vertex counts, vertex correspondence breaks down and the metric is undefined.  In that case `corner_errors_overlap_polygon` returns a single NaN and the pair is downgraded to `no_match` downstream.  Same outcome if either polygon is empty (degenerate affine, or A's warped rectangle does not intersect B).  This is a deliberate tradeoff for using a metric that lives in the overlap region — the alternative (always-4 image-corner errors, HPatches/SuperGlue convention) was tried in commits `4bb61c1`..`48accfc` and produced collapsed mAA-OP scores because the metric calibration didn't survive the image dimensions (see `reports/no_green_3/`).
+   - **Pixel correspondence rate (PCR).** `pixel_correspondence_rate` samples every pixel position `p` inside the GT overlap polygon (in A's frame), computes the per-pixel disagreement `e(p) = ||M_est @ p − M_gt @ p||` in B-pixels, and returns the fraction of pixels with `e(p) ≤ pixel_correspondence_tolerance_px` (default 1.0).  This is the signal corner-error can miss: a transform that fakes the polygon footprint but rotates the interior content (e.g. a 180° rotation about the polygon centroid) yields `mean_corner_error ≈ 0` (vertices land on themselves) but `PCR ≈ 0` (every interior pixel is moved).  Pixel sampling is bounded to ~100 k points via a stride on the polygon's bounding box; statistically equivalent to dense sampling because PCR is a ratio.  Returns NaN when the GT overlap polygon is empty or degenerate.  *Why not call it "IoU" — the older overlap-polygon IoU (intersection-over-union of two predicted overlap polygons) was redundant with `mean_corner_error` because both probed the same polygon vertices.  PCR is orthogonal to corner-error and answers the "pixel positions actually align" question that polygon IoU could not.*
+   - **mAA-OP** ("mean Average Accuracy on the Overlap Polygon") is computed in AUC form by the **reporting** stage (see §Metric definitions) — `metrics.py` only emits the raw `mean_corner_error` and the ordinal label; `reporting.py` derives mAA-OP / Precision / acc@T / matrices from the CSV.  The `-OP` suffix distinguishes it from the SuperGlue/glue-factory `mAA`, which uses the unclipped 4-image-corner reprojection error and therefore gives numerically incomparable values on these image dimensions.
    - **`result_label` values** (assigned by `categorize_result(has_transform, mean_corner_error, accuracy_tiers_px)`, driven by `RunConfig.accuracy_tiers_px`, default `(3, 5, 10)` px). Decision rules in order:
      1. `has_transform is False` → `"no_match"`.
      2. `mean_corner_error is None` **or** not finite → `"no_match"` (a transform was produced but cannot be graded — e.g. no ground truth supplied).
@@ -178,13 +182,13 @@ The overlap detection system is built around a multi-stage sequential pipeline m
      - Filename convention: `{x}_{y}_{timestamp}.ext`. The first two underscore-separated tokens of the stem are parsed as integer coordinates by `_parse_coords`; files that don't match this scheme are silently skipped.
      - Two images are considered **adjacent** when they share one coordinate and are consecutive in the other (sorted numerically). This handles 1-D strips and 2-D grids.
      - Pairs are returned in deterministic order: ascending `(_parse_coords(a), _parse_coords(b))`.
-   - **Experiment matrix.** `run_experiment_matrix` schedules a Cartesian product of `(pair, detector, descriptor, estimator, mask_mode_spec)` across a `multiprocessing` pool. Each worker handles one image pair, loads the images once, and runs every pending attempt for that pair, writing per-attempt JSON files as it goes. Matrix construction (`build_full_matrix`) skips combinations where `descriptor ∉ VALID_PAIRINGS[detector]`.
+   - **Experiment matrix.** `run_experiment_matrix` schedules a Cartesian product of `(pair, detector, descriptor, estimator, mask_mode_spec)` across a `multiprocessing` pool. Work units are `(pair, chunk-of-configs)` tuples — chunk size is controlled by the `configs_per_task` parameter (default `1` = one task per `(pair, config)`, maximum parallelism; pass `len(configs)` to recover the legacy "one worker per pair × all configs" scheme that amortises image I/O across all configs of a pair). With the default chunk size, multiple workers can attack the same pair concurrently, which keeps the pool busy on small datasets / smoke tests where `n_pairs < n_workers`. Each worker still loads its pair's images lazily and only once per task; with chunk size 1 the OS file cache keeps the per-task image read cheap when many tasks target the same pair. Matrix construction (`build_full_matrix`) skips combinations where `descriptor ∉ VALID_PAIRINGS[detector]`.
    - **Per-attempt cache resume.** Filename pattern is `{pair_id}_{detector}_{descriptor}_{estimator}_{concrete_mask_mode}.json` where `concrete_mask_mode ∈ {"no_mask", "mask"}` (never `"both"`). On startup, every attempt is probed against `_load_cached_metrics`: a present JSON with a readable `"metrics"` block is reused as-is and never re-executed. Cache misses load the image lazily (only the first miss per pair pays the I/O cost). Resume is **per-attempt**, not per-pair — an existing `_no_mask.json` is reused even when its sibling `_mask.json` is missing.
    - **Worker pool.**
      - Start method: `"spawn"` (`multiprocessing.get_context("spawn")`) — Windows-friendly, avoids inheriting parent OpenCV/GUI state.
      - Worker count: `default_experiment_workers()` → `max(1, min(cpu_count() − 1, _DEFAULT_EXPERIMENT_WORKER_CAP))`, where `_DEFAULT_EXPERIMENT_WORKER_CAP = 8`. CLI `--workers 1` forces a serial loop in the main process (no pool spawned) for debugging.
      - Per-worker initialiser (`_worker_init`): calls `cv2.setNumThreads(0)` and `cv2.ocl.setUseOpenCL(False)`. Disables OpenCV's internal TBB/OpenMP and OpenCL paths so the only parallelism is the process pool itself; without this, workers can deadlock on Windows before returning their first result.
-   - **CSV row aggregation.** For each `(pair, det, desc, est, mask_mode_spec)`, one CSV row is emitted with paired `no_mask_*` and `with_mask_*` columns (NaN on whichever side wasn't run). Stat keys merged per attempt (`_ATTEMPT_STAT_KEYS`): `result_label, iou, mean_corner_error, num_keypoints_A, num_keypoints_B, num_tentative_matches, num_inliers, inlier_ratio, detection_ms, description_ms, matching_ms, verification_ms, geometry_ms, total_ms`. Plus the short aliases `{prefix}_result` and `{prefix}_err`. The column prefix is **`no_mask`** for the no-mask attempt and **`with_mask`** for the mask attempt (asymmetric on purpose — `mask_*` would collide with `mask_mode` column in pandas filters).
+   - **CSV row aggregation.** For each `(pair, det, desc, est, mask_mode_spec)`, one CSV row is emitted with paired `no_mask_*` and `with_mask_*` columns (NaN on whichever side wasn't run). Stat keys merged per attempt (`_ATTEMPT_STAT_KEYS`): `result_label, pixel_correspondence_rate, mean_corner_error, num_keypoints_A, num_keypoints_B, num_tentative_matches, num_inliers, inlier_ratio, detection_ms, description_ms, matching_ms, verification_ms, geometry_ms, total_ms`. Plus the short aliases `{prefix}_result` and `{prefix}_err`. The column prefix is **`no_mask`** for the no-mask attempt and **`with_mask`** for the mask attempt (asymmetric on purpose — `mask_*` would collide with `mask_mode` column in pandas filters).
 
 9. **Ground Truth Annotation** (`annotation_gui.py`, `auto_aligner.py`)
    - **Annotation GUI.** Standalone OpenCV `cv2.namedWindow` UI; not Tkinter. Hotkeys: left-drag = translate, right-drag = rotate, Ctrl+left-drag = scale, middle-drag or Shift+left-drag = pan, wheel = zoom (centred on cursor), `m` = cycle render mode (normal blend ↔ anaglyph), `r` = reset alignment, `a`/`d` (or arrow keys) = previous/next pair, `s` = save current alignment, `Esc` = quit.
@@ -274,7 +278,9 @@ All components utilize a single centralized configuration object `RunConfig` def
 class RunConfig:
     # Mask scheduling
     mask_mode: str = "both"        # "no_mask" | "mask" | "both"
-    rgb_gray_threshold: int = 15
+    mask_sat_threshold: float = 0.12   # frame iff relative saturation < this
+    mask_brightness_lo: int = 15       # ...AND max(R,G,B) in [lo, hi]
+    mask_brightness_hi: int = 180
     overlap_band_fraction: float = 0.20
 
     # Detector
@@ -289,7 +295,7 @@ class RunConfig:
 
     # Matching
     matcher_filter: str = "mnn_nndr"
-    nndr_threshold: float = 0.90
+    nndr_threshold: float = 0.80
 
     # Verification
     estimator: str = "PROSAC"      # "PROSAC" | "USAC_MAGSAC"
@@ -299,22 +305,14 @@ class RunConfig:
 
     # Acceptance / categorisation
     min_inliers: int = 8                              # affine acceptance gate
+    pixel_correspondence_tolerance_px: float = 5.0   # per-pixel error budget for PCR metric
     accuracy_tiers_px: tuple[float, ...] = (3.0, 5.0, 10.0)  # tier thresholds for result_label
 
-    # I/O
-    output_dir: Path = Path("./results")
-    save_intermediate: bool = False
-    random_seed: int = 42
 ```
 
 `VALID_MASK_MODES = {"no_mask", "mask", "both"}` and `VALID_ESTIMATORS = {"PROSAC", "USAC_MAGSAC"}` live alongside `DETECTOR_NAMES` / `DESCRIPTOR_NAMES` in `config.py`. CLI entrypoints validate against these sets so unknown strings fail upfront.
 
 `DETECTOR_NAMES = ["Harris", "GFTT", "FAST", "AGAST", "BRISK", "SIFT", "USURF", "STAR", "KAZE", "AKAZE", "MSER"]` (11). `DESCRIPTOR_NAMES = ["SIFT", "RootSIFT", "USURF", "DAISY", "BRIEF", "BRISK", "SUFREAK", "MLDB", "LIOP"]` (9). `VALID_PAIRINGS` maps each detector to **every** descriptor — no hard exclusions exist; LIOP and MLDB cover the cases where OpenCV's native paths would otherwise fail (see §Custom Descriptor Implementations).
-
-**Vestigial RunConfig fields** (defined for API stability / forward-compat, but currently not read by any pipeline stage):
-- `output_dir` — the orchestrator's `run_experiment_matrix` takes `output_dir` as a direct function parameter; the `RunConfig.output_dir` field is unused.
-- `save_intermediate` — no stage consumes this; intermediate artefacts (masked images, match visualisations) are not currently persisted.
-- `random_seed` — no stage seeds an RNG from this; the OpenCV USAC estimators have no `seed` parameter, and the rest of the pipeline is deterministic.
 
 ### `detector_params` and `descriptor_params` — what they accept
 
@@ -350,7 +348,7 @@ The constants listed below influence pipeline behaviour but are deliberately **n
 
 `_ATTEMPT_COLUMN_PREFIX = {"no_mask": "no_mask", "mask": "with_mask"}` controls the CSV column prefixes per attempt (the asymmetric "mask" → "with_mask" rename keeps `mask_*` from colliding with the `mask_mode` identifier column).
 
-`_ATTEMPT_STAT_KEYS` enumerates which metrics-dict keys get the per-attempt prefix in the aggregate CSV: `result_label, iou, mean_corner_error, num_keypoints_A, num_keypoints_B, num_tentative_matches, num_inliers, inlier_ratio, detection_ms, description_ms, matching_ms, verification_ms, geometry_ms, total_ms`.
+`_ATTEMPT_STAT_KEYS` enumerates which metrics-dict keys get the per-attempt prefix in the aggregate CSV: `result_label, pixel_correspondence_rate, mean_corner_error, num_keypoints_A, num_keypoints_B, num_tentative_matches, num_inliers, inlier_ratio, detection_ms, description_ms, matching_ms, verification_ms, geometry_ms, total_ms`.
 
 ### `auto_aligner.py`
 
@@ -406,9 +404,9 @@ Implementations / LIOP).
 
 | Constant / function           | Value / behaviour | Effect |
 |--------------------------------|--------------------|--------|
-| `_MAA_CMAP_NAME`              | `"bwr_r"` (matplotlib reversed blue-white-red) | mAA heatmap colour: low → red, mid → white, high → blue. |
+| `_MAA_CMAP_NAME`              | `"bwr_r"` (matplotlib reversed blue-white-red) | mAA-OP heatmap colour: low → red, mid → white, high → blue. |
 | `_precision_cmap()`           | `LinearSegmentedColormap.from_list("rwg", ["red", "white", "green"])` | Precision heatmap colour: low → red, mid → white, high → green. |
-| `_section_vmax(tables, "maa")` | `min(1.0, max(0.3, ceil(observed_max * 10) / 10))` | Shared vmax for all mAA heatmaps in one section. NaN-aware (uses `np.isfinite` masking, not `nanmax`). |
+| `_section_vmax(tables, "maa")` | `min(1.0, max(0.3, ceil(observed_max * 10) / 10))` | Shared vmax for all mAA-OP heatmaps in one section. NaN-aware (uses `np.isfinite` masking, not `nanmax`). |
 | `_section_vmax(tables, "precision")` | `1.0` (always) | Precision is bounded in `[0, 1]`. |
 | `_ATTEMPTS`                   | `("no_mask", "with_mask", "best_of_both")` | The three attempt slices each report section breaks out separately. |
 
@@ -428,7 +426,7 @@ One file per `(pair, det, desc, est, attempt_mode)`. The filename's last segment
 
 Top-level shape: `{"result": {...PairResult fields...}, "metrics": {...}}`.
 
-**Why store raw measurements (not the categorical label)?** Because the categorical depends on `accuracy_tiers_px`. Keeping raw `iou`, `mean_corner_error`, and `corner_error_{0..3}` in the JSON means changing the tier set between report generations requires **zero pipeline reruns** — the CSV is rebuilt from the JSONs with the new tiers applied.
+**Why store raw measurements (not the categorical label)?** Because the categorical depends on `accuracy_tiers_px`. Keeping raw `pixel_correspondence_rate`, `mean_corner_error`, and the full `corner_errors` list in the JSON means changing the tier set between report generations requires **zero pipeline reruns** — the CSV is rebuilt from the JSONs with the new tiers applied.
 
 Per-file contents:
 
@@ -446,9 +444,10 @@ Per-file contents:
 |              | `time_total_s`              | float                    | End-to-end wall-clock |
 |              | `error_message`             | str \| null              | Human-readable failure reason |
 |              | `result_label`              | str                      | Echoed from metrics (see below) |
-| `metrics`    | `iou`                       | float \| null            | Clipped overlap-polygon IoU vs. GT (uses the actual visible overlap region) |
-|              | `mean_corner_error`         | float \| null, B-px      | HPatches-convention mean reprojection error: image A's four image-rectangle corners warped by the estimated vs. GT affine, averaged. Not clipped to B's bounds. |
-|              | `corner_error_{0..3}`       | float \| null, B-px      | Per-corner errors in fixed order **TL, TR, BR, BL** (matches the construction order in `corner_errors_hpatches`). Useful for debugging lopsided drift. |
+| `metrics`    | `pixel_correspondence_rate` | float \| null            | Fraction of pixels in the GT overlap region whose reprojection error under the estimated affine is within the configured tolerance (default 1 px).  Orthogonal to `mean_corner_error` — catches interior-pixel rotation that vertex-only metrics miss. |
+|              | `mean_corner_error`         | float \| null, B-px      | Mean of `corner_errors` (per-vertex distances on the clipped overlap polygon).  NaN when the metric is ungradable (vertex-count mismatch, empty polygon). |
+|              | `corner_errors`             | list[float] \| null, B-px | Per-vertex distances between the estimated and GT overlap polygons in B's frame, **variable length 3–8** (usually 3–5 in practice).  Same canonical ordering as the source polygons (clockwise, top-left first).  `null` when the metric is ungradable. |
+|              | `n_corners`                 | int \| null              | Length of `corner_errors`.  `0` signals "ungradable" (vertex-count mismatch or empty polygon); ≥ 3 means a valid measurement. |
 |              | `result_label`              | str                      | Categorical (see Stage 7) |
 |              | `num_keypoints_A/B`, `num_inliers`, `inlier_ratio` | numeric | CSV-friendly aliases of the result counts |
 |              | `*_ms`                      | float, ms                | Per-stage timings in milliseconds |
@@ -474,7 +473,7 @@ Per-attempt columns (suffix is the canonical attempt name — `no_mask` or `with
 | `{prefix}_result_label`           | Same value; long name for explicit code paths |
 | `{prefix}_err`                    | Friendly alias of `{prefix}_mean_corner_error` (px) |
 | `{prefix}_mean_corner_error`      | Mean corner reprojection error in pixels |
-| `{prefix}_iou`                    | Overlap-polygon IoU vs. GT |
+| `{prefix}_pixel_correspondence_rate` | Fraction of GT-overlap pixels within the configured tolerance of where the GT affine places them |
 | `{prefix}_num_keypoints_A/B`      | Keypoint counts per image |
 | `{prefix}_num_tentative_matches`  | Pre-RANSAC matches |
 | `{prefix}_num_inliers`            | Post-RANSAC inliers |
@@ -487,30 +486,33 @@ Per-attempt columns (suffix is the canonical attempt name — `no_mask` or `with
 
 Every section is split by **estimator** (`PROSAC`, `USAC_MAGSAC`) and by **mask attempt** (`no_mask`, `with_mask`, `best_of_both`), because the two estimators behave categorically differently enough that pooling them obscures the picture, and each attempt answers a different operational question.
 
-`best_of_both` is a derived per-row label: for each pair, the report builder picks whichever single attempt landed in the better tier (`acc_at_3 > acc_at_5 > acc_at_10 > false_match > no_match`). It's only populated for rows where `mask_mode_spec = "both"`. From that point on it's treated identically to the other two attempts — it appears in every overall, scoreboard, matrix, and benefit table.
+`best_of_both` is a derived per-row label: for each pair, the report builder picks whichever single attempt landed in the better tier (`acc_at_3 > acc_at_5 > acc_at_10 > no_match > false_match`). It's only populated for rows where `mask_mode_spec = "both"`. From that point on it's treated identically to the other two attempts — it appears in every overall, scoreboard, matrix, and benefit table.
 
 | Section                 | Granularity | What it shows | Why |
 |-------------------------|-------------|---------------|-----|
-| **Overall**             | One row per `(estimator × attempt)` = up to 6 rows | Headline mAA, **Precision**, per-tier `acc@T`, `false_match` / `no_match` shares | Single-glance summary of the whole experiment with the two key axes already separated |
-| **Per-configuration scoreboard** | One table per estimator; rows are `(detector + descriptor)` | All three attempts side-by-side with mAA, Precision, per-tier rates, false/no_match shares | Comparing pipelines within an estimator, with the fallback-vs-single-attempt question answered in-place |
-| **mAA matrices (detector × descriptor)** | One **heatmap PNG + numeric table** per `(estimator × attempt)` = up to 6 of each | mAA across the full detector/descriptor grid | Compact pipeline-vs-pipeline view that survives an 11×9 sweep cleanly. Rows and columns sorted by descending mean mAA so the strongest configurations sit top-left. Colour scale: **red → white → blue** (matplotlib `bwr_r`) |
-| **Precision matrices**  | Same layout as mAA matrices                       | Per-emission correctness rate                                                                          | Catches the failure mode mAA can hide: a pipeline that emits confident-but-wrong transforms (high `false_match`) scores low here even when mAA looks decent. Colour scale: **red → white → green** (custom diverging palette) |
-| **Fallback benefit** | One table per estimator; rows are `(detector + descriptor)` | `mAA_best − mAA_no_mask` and `mAA_best − mAA_with_mask` lift columns | Quantifies how much running `mask_mode = "both"` would actually buy you over a single mask attempt — answered post-hoc, no extra runs needed |
+| **Overall**             | One row per `(estimator × attempt)` = up to 6 rows | Headline mAA-OP, **Precision**, per-tier `acc@T`, `false_match` / `no_match` shares | Single-glance summary of the whole experiment with the two key axes already separated |
+| **Per-configuration scoreboard** | One table per estimator; rows are `(detector + descriptor)` | All three attempts side-by-side with mAA-OP, Precision, per-tier rates, false/no_match shares | Comparing pipelines within an estimator, with the fallback-vs-single-attempt question answered in-place |
+| **mAA-OP matrices (detector × descriptor)** | One **heatmap PNG + numeric table** per `(estimator × attempt)` = up to 6 of each | mAA-OP across the full detector/descriptor grid | Compact pipeline-vs-pipeline view that survives an 11×9 sweep cleanly. Rows and columns sorted by descending mean mAA-OP so the strongest configurations sit top-left. Colour scale: **red → white → blue** (matplotlib `bwr_r`), linear `[0, vmax]` |
+| **Precision matrices**  | Same layout as mAA-OP matrices                    | Per-emission correctness rate                                                                          | Catches the failure mode mAA-OP can hide: a pipeline that emits confident-but-wrong transforms (high `false_match`) scores low here even when mAA-OP looks decent. Colour scale: **red → white → green** (custom diverging palette), linear `[0, 1]` |
+| **PCR matrices**        | Same layout                                       | Per-cell mean of `pixel_correspondence_rate` — average fraction of overlap pixels within tolerance of their GT positions per `(detector, descriptor)` | Pixel-level alignment signal that complements mAA-OP (which is vertex-level only). Colour scale: **red (0) → white (0.5) → magenta (1)**, linear `Normalize(0, 1)` |
+| **Match-rate matrices** | Same layout                                       | Per-cell fraction of pairs whose label is anything other than `no_match` — i.e. the pipeline produced *some* transform, accurate or not | Decouples "did the pipeline emit anything?" from "was what it emitted any good?". A pipeline with high match-rate but low Precision is producing transforms aggressively but unreliably. Colour scale: **red (0) → white (0.5) → azure (1)**, linear `Normalize(0, 1)` |
+| **Fallback benefit** | One table per estimator; rows are `(detector + descriptor)` | `mAA-OP_best − mAA-OP_no_mask` and `mAA-OP_best − mAA-OP_with_mask` lift columns | Quantifies how much running `mask_mode = "both"` would actually buy you over a single mask attempt — answered post-hoc, no extra runs needed |
 
-Heatmap PNG filenames: `heatmap_{maa|precision}_{estimator}_{attempt}.png`, written alongside `report.md`. The numeric table beneath each PNG uses the same row/column ordering, so visual scan and precise lookup stay aligned.
+Heatmap PNG filenames: `heatmap_{maa|precision|pcr|match_rate}_{estimator}_{attempt}.png`, written alongside `report.md`. The numeric table beneath each PNG uses the same row/column ordering, so visual scan and precise lookup stay aligned.
 
 ### Metric definitions added in this section
 
 - **Precision** = `(emitted ∧ not false_match) / emitted`, where `emitted = (label != "no_match")`. Equivalently `1 − false_match / (1 − no_match)`. Answers: *when the pipeline does emit a transform, how often is it at least within the loosest configured tier (default 10 px)?* Undefined (NaN) for slices where every attempt was `no_match`.
-- This complements mAA rather than replacing it: mAA conflates `false_match` and `no_match` (both score 0), Precision distinguishes "wrong" from "abstained". A high-mAA / low-Precision pipeline is dangerous — it lands accurately most of the time but emits confidently-wrong answers in the failure cases.
+- This complements mAA-OP rather than replacing it: mAA-OP conflates `false_match` and `no_match` (both score 0), Precision distinguishes "wrong" from "abstained". A high-mAA-OP / low-Precision pipeline is dangerous — it lands accurately most of the time but emits confidently-wrong answers in the failure cases.
+- **Match rate** = `1 − no_match_share` = fraction of pairs whose label is *anything other than* `no_match`. Counts both `acc_at_*` and `false_match` as "produced a transform". Answers the orthogonal question to Precision: *of all input pairs, how often did the pipeline output some transform at all?* A pipeline with high match-rate and low Precision is producing transforms aggressively but unreliably (lots of `false_match`); a pipeline with low match-rate but high Precision is conservative (lots of `no_match`) but trustworthy when it does emit.
 
 ### Metric definitions (canonical)
 
-- **Mean corner error** — `mean(||p_pred_i − p_gt_i||₂  for i in 0..3)` where `p_pred_i = est_affine @ A_corner_i` and `p_gt_i = gt_affine @ A_corner_i`, with `A_corner_i ∈ {(0,0), (W_A,0), (W_A,H_A), (0,H_A)}`. In other words: take image A's four image-rectangle corners, warp them with both the estimated and the GT affine, and average the four Euclidean distances. Measured in B-pixels. Matches the HPatches / SuperGlue / LoFTR convention exactly — the corners are *not* clipped to B's image bounds, so reported values are directly comparable to published tables. CSV columns `corner_error_{0..3}` correspond to TL, TR, BR, BL in that order.
-- **IoU** — `intersection_area / union_area` between the predicted and ground-truth overlap polygons in image-A coordinates.
+- **Mean corner error** — mean of the Euclidean per-vertex distances between the estimated and ground-truth **clipped overlap polygons** in B's frame.  Each polygon is constructed as A's warped rectangle ∩ B's image rectangle (canonical clockwise / top-left-first ordering, vertex count **3–8**, usually 3–5).  Measured in B-pixels.  Returns NaN — and the pair is downgraded to `no_match` — when the two polygons have different vertex counts (clip against different sides of B) or when either polygon is empty (degenerate affine).  The per-vertex distances are stored in JSON as the variable-length list `corner_errors`; only the aggregated `mean_corner_error` is forwarded to the CSV.  *Note: this is not the HPatches/SuperGlue convention (always 4 unclipped image-rectangle corners); that convention was tried in commits `4bb61c1`..`48accfc` and reverted because its calibration didn't survive this dataset's image dimensions — a 0.5° rotation error blows past a 10 px tier on a 2464×2056 image.  The current metric grades the affine over the region where features can actually be matched, where the same rotation error stays in single-digit pixels.*
+- **Pixel correspondence rate (PCR)** — for each pixel position `p` inside the GT overlap polygon (in A's frame), compute `e(p) = ||M_est @ p − M_gt @ p||` in B-pixels.  PCR is the fraction of pixels with `e(p) ≤ pixel_correspondence_tolerance_px` (default 1.0 — sub-pixel alignment).  Range `[0, 1]`.  Unlike `mean_corner_error` (vertices only) and the older polygon-IoU (region shape only), PCR fails any transform that fakes the polygon footprint but rotates/translates the interior content — its "agreement" denominator counts every pixel, not just the boundary.
 - **`acc@T`** (per attempt, per config) — fraction of rows whose `result_label` is some `"acc_at_<t>"` with `t ≤ T`. Cumulative: hitting a tighter tier implies clearing every looser one.
-- **mAA** (standard AUC form, matching SuperGlue / glue-factory) — computed from the raw `mean_corner_error` values, not the ordinal labels. For each configured tier threshold T, `AUC@T = (1/T) ∫₀ᵀ recall(ε) dε` where `recall(ε)` is the fraction of pairs with corner error ≤ ε; the integral is evaluated via the trapezoidal rule on the sorted error values. `mAA = mean(AUC@T₁, AUC@T₂, …)`. Failures (NaN corner error — no transform produced) are treated as infinite error: they enter the recall denominator but never reach any threshold, so each failure reduces the score proportionally. This is the same convention as glue-factory (`error = inf` for estimation failures). Unlike binary acc@T averaging, the AUC form rewards accuracy *within* the threshold window — a pair at 0.5 px contributes more than one at 2.9 px even though both clear a 3 px threshold.
-- **`best_of_both`** — per-pair pick of the better attempt by tier rank (smaller-tier label > larger-tier label > `false_match` > `no_match`). Used to compute the fallback-benefit lift; **not** something the pipeline can produce online — it's a post-hoc analysis on the paired columns.
+- **mAA-OP** — "mean Average Accuracy on the **O**verlap **P**olygon".  Same AUC aggregation as the SuperGlue / glue-factory `mAA`, but the underlying per-pair error term is `mean_corner_error` (per-vertex distance on the clipped overlap polygon), not the HPatches-convention unclipped 4-image-corner reprojection.  Numbers are therefore **not** directly comparable to published image-matching tables — the `-OP` suffix is the warning label.  Computed from the raw `mean_corner_error` values, not the ordinal labels.  For each configured tier threshold T, `AUC@T = (1/T) ∫₀ᵀ recall(ε) dε` where `recall(ε)` is the fraction of pairs with corner error ≤ ε; the integral is evaluated via the trapezoidal rule on the sorted error values.  `mAA-OP = mean(AUC@T₁, AUC@T₂, …)`.  Failures (NaN corner error — no transform produced, or polygons with mismatched vertex counts) are treated as infinite error: they enter the recall denominator but never reach any threshold, so each failure reduces the score proportionally.  This is the same convention as glue-factory (`error = inf` for estimation failures).  Unlike binary acc@T averaging, the AUC form rewards accuracy *within* the threshold window — a pair at 0.5 px contributes more than one at 2.9 px even though both clear a 3 px threshold.
+- **`best_of_both`** — per-pair pick of the better attempt by tier rank (smallest-tier label > larger-tier labels > `no_match` > `false_match`). `no_match` ranks above `false_match` because `no_match` is neutral for Precision (excluded from both numerator and denominator), while `false_match` is an incorrect emission that actively lowers Precision; both contribute zero AUC to mAA-OP at standard tier sizes so the ordering has no effect there. Used to compute the fallback-benefit lift; **not** something the pipeline can produce online — it's a post-hoc analysis on the paired columns.
 
 All markdown / JSON I/O is UTF-8.
 

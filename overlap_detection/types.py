@@ -123,7 +123,7 @@ class GroundTruth:
     """Manual annotation of the overlap region for one image pair.
 
     Produced by the annotation GUI and consumed by the metrics stage
-    to compute accuracy metrics (corner error, IoU).
+    to compute accuracy metrics (corner error, pixel correspondence rate).
 
     The source of truth is ``affine_matrix_A_to_B`` (2×3, maps image-A
     pixel coordinates to image-B pixel coordinates) together with the two

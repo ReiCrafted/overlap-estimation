@@ -33,7 +33,13 @@ def parse_args():
               f"resolved to {default_experiment_workers()} on this machine). "
               "Pass 1 for serial execution."),
     )
-    parser.add_argument("--config", type=Path, help="Optional YAML config overrides.", default=None)
+    parser.add_argument(
+        "--configs-per-task", type=int, default=1,
+        help=("Configs handled per worker task (default 1 = max parallelism, "
+              "multiple workers can share one pair).  Pass a larger value "
+              "to amortise image I/O across more configs per task; pass "
+              "len(configs) to recover the legacy 'one worker per pair' scheme."),
+    )
     return parser.parse_args()
 
 def load_groundtruth(gt_dir: Path, img_a_stem: str, img_b_stem: str) -> GroundTruth | None:
@@ -107,7 +113,11 @@ def main():
     n_workers = args.workers if args.workers is not None else default_experiment_workers()
     print(f"Running {len(configs)} configurations across {len(dataset_pairs)} image pairs "
           f"({len(configs) * len(dataset_pairs)} total runs) on {n_workers} worker(s).")
-    run_experiment_matrix(dataset_pairs, configs, args.output_dir, n_workers=n_workers)
+    run_experiment_matrix(
+        dataset_pairs, configs, args.output_dir,
+        n_workers=n_workers,
+        configs_per_task=args.configs_per_task,
+    )
 
 if __name__ == "__main__":
     main()

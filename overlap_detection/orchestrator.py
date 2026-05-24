@@ -123,12 +123,16 @@ def _execute_pipeline(
         # 1. Preprocessing (masking)
         mask_A = apply_mask_mode(image_A, mask_mode_to_use,
                                  config.overlap_band_fraction,
-                                 config.rgb_gray_threshold,
-                                 side="right")
+                                 side="right",
+                                 sat_threshold=config.mask_sat_threshold,
+                                 brightness_lo=config.mask_brightness_lo,
+                                 brightness_hi=config.mask_brightness_hi)
         mask_B = apply_mask_mode(image_B, mask_mode_to_use,
                                  config.overlap_band_fraction,
-                                 config.rgb_gray_threshold,
-                                 side="left")
+                                 side="left",
+                                 sat_threshold=config.mask_sat_threshold,
+                                 brightness_lo=config.mask_brightness_lo,
+                                 brightness_hi=config.mask_brightness_hi)
 
         # 2. Detection
         t0 = time.perf_counter()
@@ -205,7 +209,9 @@ def _execute_pipeline(
 
     result.time_total_s = time.perf_counter() - t_start_total
     metrics = compute_pair_metrics(
-        result, ground_truth, config.accuracy_tiers_px,
+        result, ground_truth,
+        accuracy_tiers_px=config.accuracy_tiers_px,
+        pixel_correspondence_tolerance_px=config.pixel_correspondence_tolerance_px,
     )
     return result, metrics
 
@@ -304,7 +310,7 @@ _ATTEMPT_COLUMN_PREFIX = {"no_mask": "no_mask", "mask": "with_mask"}
 
 # Per-attempt stat keys that get suffixed and merged into the CSV row.
 _ATTEMPT_STAT_KEYS = (
-    "result_label", "iou", "mean_corner_error",
+    "result_label", "pixel_correspondence_rate", "mean_corner_error",
     "num_keypoints_A", "num_keypoints_B",
     "num_tentative_matches", "num_inliers", "inlier_ratio",
     "detection_ms", "description_ms", "matching_ms",
@@ -361,14 +367,21 @@ def _load_cached_metrics(json_path: Path) -> Optional[dict]:
 
 
 def _pair_worker(args):
-    """Run all pending configs for one image pair.
+    """Run a chunk of pending configs for one image pair.
+
+    Each worker task handles `len(configs)` configs for the pair — that may
+    be all of them (chunk size = total config count, legacy behaviour, best
+    image-I/O amortisation) or just one (chunk size = 1, maximum parallelism,
+    enables multiple workers to attack the same pair concurrently). Chunk
+    size is set by `run_experiment_matrix(configs_per_task=…)`.
 
     Returns ``(pair_id, rows, error)`` where ``rows`` is a list of merged
-    CSV row dicts (one per config) and ``error`` is a short string when the
-    images could not be read.
+    CSV row dicts (one per config in the chunk) and ``error`` is a short
+    string when the images could not be read.
     """
     image_A_path, image_B_path, gt, configs, output_dir = args
     pair_id = f"{image_A_path.stem}_{image_B_path.stem}"
+    n_in_chunk = len(configs)
 
     # Lazy image load: only read if at least one attempt is missing a cached JSON.
     img_A: Optional[np.ndarray] = None
@@ -399,7 +412,7 @@ def _pair_worker(args):
                 if img_A is None or img_B is None:
                     return pair_id, [], (
                         f"could not read {image_A_path.name} / {image_B_path.name}"
-                    )
+                    ), n_in_chunk
 
             try:
                 result, metrics = _execute_pipeline(
@@ -429,7 +442,7 @@ def _pair_worker(args):
 
         rows.append(row)
 
-    return pair_id, rows, None
+    return pair_id, rows, None, n_in_chunk
 
 
 def run_experiment_matrix(
@@ -437,13 +450,18 @@ def run_experiment_matrix(
     configs: list[RunConfig],
     output_dir: Path,
     n_workers: Optional[int] = None,
+    configs_per_task: int = 1,
 ) -> None:
     """Run all combinations of pairs × configs.  Write per-attempt JSONs and
     one aggregated CSV row per ``(pair, detector, descriptor, estimator,
-    mask_mode)`` into ``output_dir``.  Pairs are dispatched across a process
-    pool (each worker handles one pair × all its pending configs, loading
-    the images once).  Resumes by re-using any per-attempt JSON that already
-    exists.
+    mask_mode)`` into ``output_dir``.  Resumes by re-using any per-attempt
+    JSON that already exists.
+
+    Work units are ``(pair, chunk-of-configs)`` tuples dispatched across a
+    process pool.  Multiple workers can therefore process configs for the
+    *same* pair concurrently — useful when ``n_pairs < n_workers`` (small
+    datasets / smoke tests) where the legacy "one worker per pair" scheme
+    left workers idle.
 
     Parameters
     ----------
@@ -452,19 +470,32 @@ def run_experiment_matrix(
         :func:`default_experiment_workers`.  Pass ``1`` to force serial
         execution (useful for debugging — the worker still runs in the same
         process, no pool is spawned).
+    configs_per_task
+        Number of configs each worker task handles for a single pair.
+        Default ``1`` (one task per ``(pair, config)``) maximises parallelism
+        at the cost of one image read per task.  Pass ``len(configs)`` to
+        recover the legacy behaviour (one worker handles a pair's entire
+        config list, amortising image I/O across all configs).
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     if n_workers is None:
         n_workers = default_experiment_workers()
     n_workers = max(1, n_workers)
+    if configs_per_task < 1:
+        raise ValueError(f"configs_per_task must be ≥ 1, got {configs_per_task}")
 
+    # Chunk configs per pair.  Each task is (pair, sub-list of configs).
+    # The worker still loads images lazily and only once per task, so a small
+    # chunk size pays at most one image read per chunk (mitigated by the OS
+    # file cache when many workers hit the same pair concurrently).
     worker_args = [
-        (img_a, img_b, gt, configs, output_dir)
+        (img_a, img_b, gt, list(configs[i:i + configs_per_task]), output_dir)
         for img_a, img_b, gt in dataset_pairs
+        for i in range(0, len(configs), configs_per_task)
     ]
 
-    # Progress bar counts CSV rows per pair, not pipeline attempts — keeps
-    # the bar aligned with the scoreboard size the user actually sees.
+    # Progress bar counts CSV rows — one per (pair, config) — which matches
+    # the scoreboard size the user actually sees.
     total_rows = len(dataset_pairs) * len(configs)
     all_rows: list[dict] = []
 
@@ -476,19 +507,19 @@ def run_experiment_matrix(
     with tqdm(total=total_rows, desc="Running Matrix") as pbar:
         if n_workers == 1:
             for args in worker_args:
-                pair_id, rows, error = _pair_worker(args)
+                pair_id, rows, error, n_in_chunk = _pair_worker(args)
                 consume(pair_id, rows, error)
-                pbar.update(len(configs))
+                pbar.update(n_in_chunk)
         else:
             ctx = get_context("spawn")
             # initializer disables cv2 threading per worker; without it the
             # pool can deadlock on Windows before any worker returns a result.
             with ctx.Pool(processes=n_workers, initializer=_worker_init) as pool:
-                for pair_id, rows, error in pool.imap_unordered(
+                for pair_id, rows, error, n_in_chunk in pool.imap_unordered(
                     _pair_worker, worker_args
                 ):
                     consume(pair_id, rows, error)
-                    pbar.update(len(configs))
+                    pbar.update(n_in_chunk)
 
     if all_rows:
         try:
