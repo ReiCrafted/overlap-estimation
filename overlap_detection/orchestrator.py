@@ -70,11 +70,11 @@ def list_image_pairs(dataset_dir: Path) -> list[tuple[Path, Path]]:
 
     pairs: list[tuple[Path, Path]] = []
 
-    # Same x, consecutive y
-    for x in sorted(set(x for x, _ in coord_map)):
-        col_ys = sorted(y for (cx, y) in coord_map if cx == x)
-        for i in range(len(col_ys) - 1):
-            pairs.append((coord_map[(x, col_ys[i])], coord_map[(x, col_ys[i + 1])]))
+    # # Same x, consecutive y
+    # for x in sorted(set(x for x, _ in coord_map)):
+    #     col_ys = sorted(y for (cx, y) in coord_map if cx == x)
+    #     for i in range(len(col_ys) - 1):
+    #         pairs.append((coord_map[(x, col_ys[i])], coord_map[(x, col_ys[i + 1])]))
 
     # Same y, consecutive x
     for y in sorted(set(y for _, y in coord_map)):
