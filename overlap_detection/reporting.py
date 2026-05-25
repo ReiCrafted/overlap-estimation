@@ -645,7 +645,7 @@ def _order_by_average(table: pd.DataFrame) -> pd.DataFrame:
 
 def _save_heatmap(table: pd.DataFrame, path: Path, *, title: str,
                   cmap, vmin: float = 0.0, vmax: float = 1.0,
-                  norm=None) -> None:
+                  norm=None, cell_fmt: str = ".2f") -> None:
     """Render a heatmap with annotated cell values and save to ``path``.
 
     Cell text colour adapts to the underlying value — extreme-end cells
@@ -683,7 +683,7 @@ def _save_heatmap(table: pd.DataFrame, path: Path, *, title: str,
             # White text on dark extremes; black text near the centre (0.5).
             nv = float(norm(v))
             text_color = "white" if abs(nv - 0.5) > 0.35 else "black"
-            ax.text(j, i, f"{v:.2f}", ha="center", va="center",
+            ax.text(j, i, f"{v:{cell_fmt}}", ha="center", va="center",
                     color=text_color, fontsize=8)
     fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     ax.set_title(title)
@@ -696,6 +696,143 @@ def _save_heatmap(table: pd.DataFrame, path: Path, *, title: str,
 
 def _heatmap_filename(metric: str, estimator: str, attempt: str) -> str:
     return f"heatmap_{metric}_{estimator}_{attempt}.png"
+
+
+def _timing_cmap():
+    """Sequential green→yellow→red colormap for timing heatmaps.
+    Lower (faster) = green; higher (slower) = red."""
+    return "RdYlGn_r"
+
+
+_TIMING_STAGES = (
+    ("detection_ms",     "Detect (ms)"),
+    ("description_ms",   "Describe (ms)"),
+    ("matching_ms",      "Match (ms)"),
+    ("verification_ms",  "Verify (ms)"),
+    ("geometry_ms",      "Geometry (ms)"),
+)
+
+
+def _collect_stage_times(df: pd.DataFrame, estimator: str) -> pd.DataFrame:
+    """Mean time per stage for each (detector, descriptor) group within estimator.
+
+    Pools no_mask and with_mask attempts: both columns are included in the
+    mean whenever present, so the result is an average over all pair attempts.
+    Returns a DataFrame with columns: detector, descriptor, config,
+    detection_ms, description_ms, matching_ms, verification_ms, geometry_ms,
+    total_ms.
+    """
+    sub = df[df["estimator"] == estimator]
+    if sub.empty:
+        return pd.DataFrame()
+
+    stage_keys = [k for k, _ in _TIMING_STAGES] + ["total_ms"]
+    records = []
+    for (det, desc), group in sub.groupby(["detector", "descriptor"], sort=False):
+        rec: dict = {"config": f"{det}+{desc}", "detector": det, "descriptor": desc}
+        for stage_key in stage_keys:
+            vals: list[float] = []
+            for prefix in ("no_mask", "with_mask"):
+                col = f"{prefix}_{stage_key}"
+                if col in group.columns:
+                    vals.extend(
+                        pd.to_numeric(group[col], errors="coerce").dropna().tolist()
+                    )
+            rec[stage_key] = float(np.mean(vals)) if vals else float("nan")
+        records.append(rec)
+
+    return pd.DataFrame(records)
+
+
+def _render_timing_section(df: pd.DataFrame, estimators: list[str],
+                           output_dir: Path) -> list[str]:
+    """Timing tables (one per estimator) + total-time heatmaps (one per estimator).
+
+    Tables: rows = detector+descriptor sorted by ascending mean total_ms,
+    columns = mean ms for each of the five pipeline stages plus total.
+
+    Heatmaps: detector rows × descriptor columns, value = mean total_ms,
+    sorted ascending (fastest at top-left), shared colour scale across
+    all estimators, green (fast) → yellow → red (slow).
+    """
+    out: list[str] = ["\n## Timing (mean ms per pair)\n"]
+    out.append(
+        "Mean wall-clock time per pipeline stage, averaged over all pairs and "
+        "mask attempts. Verification time varies by estimator; the other "
+        "stages are estimator-independent.\n"
+    )
+
+    # --- Per-estimator tables ---
+    for est in estimators:
+        timing_df = _collect_stage_times(df, est)
+        if timing_df.empty:
+            continue
+        timing_df = timing_df.sort_values("total_ms", ascending=True,
+                                          na_position="last")
+        stage_headers = [label for _, label in _TIMING_STAGES] + ["Total (ms)"]
+        out.append(f"\n### {est}\n")
+        out.append("| Config | " + " | ".join(stage_headers) + " |")
+        out.append("|" + "---|" * (len(stage_headers) + 1))
+        for _, row in timing_df.iterrows():
+            cells = [str(row["config"])]
+            for stage_key, _ in _TIMING_STAGES:
+                v = row.get(stage_key)
+                cells.append("N/A" if pd.isna(v) else f"{v:.1f}")
+            tot = row.get("total_ms")
+            cells.append("N/A" if pd.isna(tot) else f"{tot:.1f}")
+            out.append("| " + " | ".join(cells) + " |")
+
+    # --- Total-time heatmaps ---
+    heatmap_tables: list[tuple[str, pd.DataFrame]] = []
+    for est in estimators:
+        timing_df = _collect_stage_times(df, est)
+        if timing_df.empty or "detector" not in timing_df.columns:
+            continue
+        pivot = timing_df.pivot(
+            index="detector", columns="descriptor", values="total_ms"
+        )
+        if pivot.empty or pivot.isna().all().all():
+            continue
+        # Ascending sort: fastest detector at top, fastest descriptor at left.
+        row_order = (
+            pivot.mean(axis=1, skipna=True)
+            .sort_values(ascending=True, na_position="last")
+            .index
+        )
+        col_order = (
+            pivot.mean(axis=0, skipna=True)
+            .sort_values(ascending=True, na_position="last")
+            .index
+        )
+        heatmap_tables.append((est, pivot.loc[row_order, col_order]))
+
+    if not heatmap_tables:
+        return out
+
+    all_vals = np.concatenate([t.values.ravel() for _, t in heatmap_tables])
+    all_vals = all_vals[~np.isnan(all_vals)]
+    vmax = float(np.max(all_vals)) if len(all_vals) > 0 else 1.0
+
+    out.append("\n### Total-time heatmaps\n")
+    out.append(
+        "Detector rows × descriptor columns, sorted by ascending mean total time "
+        "(fastest at top-left). "
+        "Colour: green (fast) → yellow → red (slow). "
+        f"Shared scale: 0 → {vmax:.0f} ms.\n"
+    )
+
+    for est, table in heatmap_tables:
+        png_name = f"heatmap_timing_{est}.png"
+        _save_heatmap(
+            table, output_dir / png_name,
+            title=f"Mean total time (ms) — {est}",
+            cmap=_timing_cmap(), vmin=0.0, vmax=vmax,
+            cell_fmt=".0f",
+        )
+        out.append(f"\n#### {est}\n")
+        out.append(f"![Timing {est}](./{png_name})\n")
+
+    return out
 
 
 def _section_vmax(tables: list[pd.DataFrame], metric: str) -> float:
@@ -912,9 +1049,18 @@ def write_summary_report(csv_path: Path, output_dir: Path) -> None:
       white (0.5) → azure (1), linear ``Normalize(0, 1)``.
     * **Fallback benefit** — one table per estimator. Per detector+descriptor
       combo, lift of the best_of_both policy over each single attempt.
+    * **Timing** — one table per estimator: rows are detector+descriptor
+      combos sorted by ascending mean total time, columns are mean ms for
+      each of the five pipeline stages (detection, description, matching,
+      verification, geometry) plus total.  Followed by one heatmap per
+      estimator (``heatmap_timing_{estimator}.png``): detector rows ×
+      descriptor columns, value = mean total time per pair, sorted ascending
+      (fastest at top-left), colour green (fast) → yellow → red (slow),
+      shared scale across estimators.
 
     Heatmap PNGs are saved alongside ``report.md`` as
-    ``heatmap_{maa|precision|pcr|match_rate}_{estimator}_{attempt}.png``.
+    ``heatmap_{maa|precision|pcr|match_rate}_{estimator}_{attempt}.png`` and
+    ``heatmap_timing_{estimator}.png``.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     if not csv_path.exists():
@@ -944,6 +1090,7 @@ def write_summary_report(csv_path: Path, output_dir: Path) -> None:
     report.extend(_render_matrices_section(df, estimators, tiers, "pcr", output_dir))
     report.extend(_render_matrices_section(df, estimators, tiers, "match_rate", output_dir))
     report.extend(_render_fallback_benefit(df, estimators, tiers))
+    report.extend(_render_timing_section(df, estimators, output_dir))
 
     with open(output_dir / "report.md", "w", encoding="utf-8") as f:
         f.write("\n".join(report))
