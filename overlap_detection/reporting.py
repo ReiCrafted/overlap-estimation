@@ -24,7 +24,7 @@ project_overview.md §Stage 7 for the rationale.
 mAA-OP is computed from the per-pair ``{attempt}_err`` columns in the CSV,
 not from the ordinal result labels.
 
-For each configured accuracy tier threshold T (default 3, 5, 10 px):
+For each configured accuracy tier threshold T (default 3, 10, 22 px):
 
     AUC@T = (1/T) * ∫₀ᵀ recall(ε) dε
 
@@ -301,9 +301,22 @@ def _match_rate(label_series: pd.Series) -> float:
 
 
 def _add_best_of_both_err_column(df: pd.DataFrame) -> pd.DataFrame:
-    """Add ``best_of_both_err``: the corner error of whichever attempt
-    ``_best_of_both`` selected per row.  Mirrors the label-picking logic so
-    AUC-based mAA-OP for best_of_both uses the same attempt that won the label."""
+    """Add ``best_of_both_err``: the smaller of (no_mask_err, with_mask_err)
+    per row, with NaN treated as infinity.
+
+    Picked by raw error value, **not** by label rank, because labels are
+    tier-level (``acc_at_3``/``acc_at_5``/…) while mAA-OP cares about
+    continuous within-tier accuracy.  Two attempts that both land in
+    ``acc_at_3`` (e.g. 2.5 px vs. 0.5 px) tie on label rank, and the
+    label-picker would default to no_mask's 2.5 — discarding the 0.5
+    even though it contributes more to AUC@3.  Picking ``min(err)``
+    instead guarantees ``mAA-OP_best_of_both ≥ max(mAA-OP_no_mask,
+    mAA-OP_with_mask)`` for every cell.
+
+    Rows where one attempt did not run (label NaN) get NaN; rows where
+    both errs are NaN also get NaN.  Otherwise NaN is filled with inf so
+    a real measurement always beats a missing one in the min.
+    """
     if "best_of_both_err" in df.columns:
         return df
     needed = {"no_mask_err", "with_mask_err", "no_mask_result", "with_mask_result"}
@@ -311,33 +324,35 @@ def _add_best_of_both_err_column(df: pd.DataFrame) -> pd.DataFrame:
         df["best_of_both_err"] = pd.NA
         return df
 
-    def _rank(label) -> tuple[int, float]:
-        if pd.isna(label) or label == "no_match":
-            return (3, 0.0)
-        if label == "false_match":
-            return (3, 1.0)
-        t = _parse_tier(label)
-        return (1, t) if t is not None else (3, 0.0)
+    nm = pd.to_numeric(df["no_mask_err"], errors="coerce")
+    wm = pd.to_numeric(df["with_mask_err"], errors="coerce")
+    both_ran = df["no_mask_result"].notna() & df["with_mask_result"].notna()
+    both_err_nan = nm.isna() & wm.isna()
 
-    errs = []
-    for i in range(len(df)):
-        nm_res = df["no_mask_result"].iat[i]
-        wm_res = df["with_mask_result"].iat[i]
-        if pd.isna(nm_res) or pd.isna(wm_res):
-            errs.append(float("nan"))
-        elif _rank(nm_res) <= _rank(wm_res):   # no_mask wins (or tied)
-            errs.append(df["no_mask_err"].iat[i])
-        else:
-            errs.append(df["with_mask_err"].iat[i])
-    df["best_of_both_err"] = errs
+    picked = np.minimum(nm.fillna(float("inf")), wm.fillna(float("inf")))
+    # Rows where neither attempt produced an error → keep NaN (not inf).
+    picked = picked.where(~both_err_nan, other=float("nan"))
+    # Rows where only one attempt ran → NaN (not a valid best_of_both).
+    picked = picked.where(both_ran, other=float("nan"))
+
+    df["best_of_both_err"] = picked
     return df
 
 
 def _add_best_of_both_pcr_column(df: pd.DataFrame) -> pd.DataFrame:
-    """Add ``best_of_both_pixel_correspondence_rate``: the PCR of whichever
-    attempt won the ``best_of_both`` label per row.  Mirrors
-    :func:`_add_best_of_both_err_column` so the PCR matrix for best_of_both
-    uses the same attempt that won the label."""
+    """Add ``best_of_both_pixel_correspondence_rate``: the larger of
+    (no_mask_pcr, with_mask_pcr) per row, with NaN treated as ``-inf``.
+
+    Picked by raw PCR value, **not** by label rank, for the same reason
+    as :func:`_add_best_of_both_err_column`: labels are tier-level and
+    discard the sub-label PCR ordering that the metric actually cares
+    about.  Picking ``max(pcr)`` guarantees ``PCR_best_of_both ≥
+    max(PCR_no_mask, PCR_with_mask)`` for every cell.
+
+    Rows where one attempt did not run get NaN; rows where both PCRs are
+    NaN also get NaN.  Otherwise NaN is filled with -inf so a real
+    measurement always beats a missing one in the max.
+    """
     out_col = "best_of_both_pixel_correspondence_rate"
     if out_col in df.columns:
         return df
@@ -348,25 +363,18 @@ def _add_best_of_both_pcr_column(df: pd.DataFrame) -> pd.DataFrame:
         df[out_col] = pd.NA
         return df
 
-    def _rank(label) -> tuple[int, float]:
-        if pd.isna(label) or label == "no_match":
-            return (3, 0.0)
-        if label == "false_match":
-            return (3, 1.0)
-        t = _parse_tier(label)
-        return (1, t) if t is not None else (3, 0.0)
+    nm = pd.to_numeric(df[no_mask_pcr], errors="coerce")
+    wm = pd.to_numeric(df[with_mask_pcr], errors="coerce")
+    both_ran = df["no_mask_result"].notna() & df["with_mask_result"].notna()
+    both_pcr_nan = nm.isna() & wm.isna()
 
-    vals = []
-    for i in range(len(df)):
-        nm_res = df["no_mask_result"].iat[i]
-        wm_res = df["with_mask_result"].iat[i]
-        if pd.isna(nm_res) or pd.isna(wm_res):
-            vals.append(float("nan"))
-        elif _rank(nm_res) <= _rank(wm_res):
-            vals.append(df[no_mask_pcr].iat[i])
-        else:
-            vals.append(df[with_mask_pcr].iat[i])
-    df[out_col] = vals
+    picked = np.maximum(nm.fillna(float("-inf")), wm.fillna(float("-inf")))
+    # Rows where neither attempt produced a PCR → keep NaN (not -inf).
+    picked = picked.where(~both_pcr_nan, other=float("nan"))
+    # Rows where only one attempt ran → NaN.
+    picked = picked.where(both_ran, other=float("nan"))
+
+    df[out_col] = picked
     return df
 
 
@@ -581,7 +589,30 @@ def _metric_matrix(df: pd.DataFrame, estimator: str, attempt: str,
             else:
                 value = float("nan")
         elif metric == "match_rate":
-            value = _match_rate(label_s)
+            if attempt == "best_of_both":
+                # Match-rate for best_of_both = "did EITHER attempt produce a
+                # transform?".  Bypass the best_of_both_result label column,
+                # which is picked Precision-optimally (prefers no_match over
+                # false_match to avoid wrong emissions) and would therefore
+                # under-count match_rate.  Restricted to rows where both
+                # attempts actually ran (label NaN means that attempt was
+                # never executed for this row's mask_mode_spec).
+                nm = group.get("no_mask_result")
+                wm = group.get("with_mask_result")
+                if nm is None or wm is None:
+                    value = float("nan")
+                else:
+                    both_ran = nm.notna() & wm.notna()
+                    if not both_ran.any():
+                        value = float("nan")
+                    else:
+                        either_emitted = (
+                            (nm[both_ran] != "no_match")
+                            | (wm[both_ran] != "no_match")
+                        )
+                        value = float(either_emitted.mean())
+            else:
+                value = _match_rate(label_s)
         else:
             raise ValueError(f"Unknown metric: {metric!r}")
         rows.append({"detector": det, "descriptor": desc, "value": value})
@@ -668,31 +699,14 @@ def _heatmap_filename(metric: str, estimator: str, attempt: str) -> str:
 
 
 def _section_vmax(tables: list[pd.DataFrame], metric: str) -> float:
-    """Pick a single ``vmax`` for every heatmap in one section so they stay
-    visually comparable.
+    """Return the shared ``vmax`` for every heatmap in one section.
 
-    * Precision, PCR, match_rate: always ``1.0`` — these metrics are
-      bounded in ``[0, 1]`` and typically span enough of the range that
-      a fixed top makes panels comparable.
-    * mAA-OP (AUC form): use the observed max across all tables, rounded up to
-      the next 0.1 and floored at ``0.3``.  Floor prevents three near-zero
-      tables from amplifying noise; rounding keeps the colorbar tidy.
-      NaN cells (sparse tables) are ignored — without nan-aware reduction
-      one missing combo would collapse the whole table's max to NaN and the
-      shared scale to the 0.3 floor.
+    All four matrix types (mAA-OP, Precision, PCR, match_rate) are bounded
+    in ``[0, 1]`` and share a fixed top of ``1.0`` so panels stay directly
+    comparable both within a section and across sections.  ``tables`` is
+    accepted for backward-compatibility but is no longer consulted.
     """
-    if metric != "maa":
-        return 1.0
-    observed = 0.0
-    for t in tables:
-        if t.empty:
-            continue
-        arr = t.to_numpy(dtype=float, na_value=np.nan)
-        finite = arr[np.isfinite(arr)]
-        if finite.size:
-            observed = max(observed, float(finite.max()))
-    rounded = float(np.ceil(observed * 10.0) / 10.0)
-    return float(min(1.0, max(0.3, rounded)))
+    return 1.0
 
 
 def _render_matrices_section(df: pd.DataFrame, estimators: list[str],
@@ -706,10 +720,11 @@ def _render_matrices_section(df: pd.DataFrame, estimators: list[str],
     (table uses the same row/column ordering, so the heatmap and the lookup
     table line up cell-for-cell).
 
-    All heatmaps in a section share a single linear colour scale `[0, vmax]`
-    (vmax via :func:`_section_vmax`).  Diverging colormaps put white at the
-    midpoint of that range — for the bounded `[0, 1]` metrics (Precision,
-    PCR, match_rate) that means white sits at exactly 0.5.
+    All heatmaps across every section share a single fixed linear colour
+    scale `[0, 1]` (via :func:`_section_vmax`).  All four metrics
+    (mAA-OP, Precision, PCR, match_rate) are bounded in `[0, 1]`, so a
+    fixed top keeps panels directly comparable both within and across
+    sections — and diverging colormaps put white at exactly 0.5.
     """
     if metric == "maa":
         pretty_metric = "mAA-OP"
@@ -730,10 +745,23 @@ def _render_matrices_section(df: pd.DataFrame, estimators: list[str],
     else:
         raise ValueError(f"Unknown matrix metric: {metric!r}")
 
+    # Precision and PCR are both quality-given-emission metrics: each cell's
+    # value is averaged only over pairs where that attempt actually emitted.
+    # The per-pair best_of_both pick can therefore drag the cell mean below an
+    # individual attempt's mean (different denominators), and the metric is an
+    # oracle-policy view rather than something the runtime can produce.  Hide
+    # the best_of_both panel for these two metrics — mAA-OP and match_rate
+    # cover the "overall ceiling" question.  The scoreboard and Overall tables
+    # still display best_of_both Precision for users who want the detail.
+    if metric in ("precision", "pcr"):
+        attempts_to_show = tuple(a for a in _ATTEMPTS if a != "best_of_both")
+    else:
+        attempts_to_show = _ATTEMPTS
+
     # Pass 1: collect all the ordered tables so we can pick a shared scale.
     populated: list[tuple[str, str, pd.DataFrame]] = []
     for est in estimators:
-        for attempt in _ATTEMPTS:
+        for attempt in attempts_to_show:
             table = _metric_matrix(df, est, attempt, metric, tiers)
             if table.empty or table.isna().all().all():
                 continue
@@ -860,13 +888,23 @@ def write_summary_report(csv_path: Path, output_dir: Path) -> None:
       acc@T, false_match, no_match.
     * **mAA-OP matrices** — heatmap PNG + numeric table per (estimator × attempt),
       up to 6 of each. Detectors (rows) and descriptors (columns) sorted by
-      descending mean mAA-OP. Colour: red (low) → white → blue (high), shared
-      scale across the section (see :func:`_section_vmax`).
-    * **Precision matrices** — same layout as mAA-OP matrices but coloured
-      red (low) → white → green (high).
-    * **PCR matrices** — same layout, aggregating per-pair
+      descending mean mAA-OP. Colour: red (low) → white → blue (high),
+      linear ``Normalize(0, 1)`` — same fixed `[0, 1]` scale as every other
+      matrix section.
+    * **Precision matrices** — same layout as mAA-OP matrices but **only
+      shows `no_mask` and `with_mask` panels** (best_of_both is omitted
+      from this matrix section because Precision is an emission-conditional
+      diagnostic and best_of_both Precision represents an oracle abstention
+      policy that adds little over the individual views; best_of_both
+      Precision is still shown in the scoreboard and Overall tables).
+      Coloured red (low) → white → green (high).
+    * **PCR matrices** — same layout as Precision (no_mask and with_mask
+      only — best_of_both omitted), aggregating per-pair
       ``pixel_correspondence_rate`` by mean within each (detector,
-      descriptor) cell. Colour: red (0) → white (0.5) → magenta (1),
+      descriptor) cell.  PCR is conditioned on emission and is **not**
+      monotonic under per-pair best_of_both selection because each
+      attempt averages over a different set of pairs (denominator
+      mismatch).  Colour: red (0) → white (0.5) → magenta (1),
       linear ``Normalize(0, 1)``.
     * **Match-rate matrices** — same layout, cell value = fraction of pairs
       whose result is anything other than ``no_match`` (i.e. the pipeline

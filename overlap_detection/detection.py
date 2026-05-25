@@ -12,32 +12,18 @@ from overlap_detection.types import Keypoint
 # Per-detector default parameters
 # ---------------------------------------------------------------------------
 
-# _DETECTOR_DEFAULTS = {
-#     "Harris": {"maxCorners": 5000, "qualityLevel": 0.01, "minDistance": 10, "k": 0.04},
-#     "GFTT":   {"maxCorners": 5000, "qualityLevel": 0.01, "minDistance": 10},
-#     "FAST":   {"threshold": 10, "nonmaxSuppression": True, "type": cv2.FAST_FEATURE_DETECTOR_TYPE_9_16},
-#     "AGAST":  {"threshold": 10, "nonmaxSuppression": True},
-#     "BRISK":  {"thresh": 30, "octaves": 4},
-#     "SIFT":   {"nfeatures": 0, "contrastThreshold": 0.04, "edgeThreshold": 10},
-#     "USURF":  {"hessianThreshold": 100, "upright": True},
-#     "STAR":   {"maxSize": 45, "responseThreshold": 30},
-#     "KAZE":   {"threshold": 0.001},
-#     "AKAZE":  {"threshold": 0.001},
-#     "MSER":   {"min_area": 20, "max_area": 8100, "max_variation": 0.5},
-# }
-
-_DETECTOR_DEFAULTS = { #edited for theoretical reasons
+_DETECTOR_DEFAULTS = {
     "Harris": {"maxCorners": 5000, "qualityLevel": 0.01, "minDistance": 10, "k": 0.04},
     "GFTT":   {"maxCorners": 5000, "qualityLevel": 0.01, "minDistance": 10},
     "FAST":   {"threshold": 8, "nonmaxSuppression": True, "type": cv2.FAST_FEATURE_DETECTOR_TYPE_9_16},
     "AGAST":  {"threshold": 8, "nonmaxSuppression": True},
-    "BRISK":  {"thresh": 20, "octaves": 4},
-    "SIFT":   {"nfeatures": 0, "contrastThreshold": 0.03, "edgeThreshold": 10},
-    "USURF":  {"hessianThreshold": 50, "upright": True},
+    "BRISK":  {"thresh": 30, "octaves": 4},
+    "SIFT":   {"nfeatures": 0, "contrastThreshold": 0.04, "edgeThreshold": 10},
+    "USURF":  {"hessianThreshold": 100, "upright": True},
     "STAR":   {"maxSize": 15, "responseThreshold": 20},
     "KAZE":   {"threshold": 0.001},
     "AKAZE":  {"threshold": 0.001},
-    "MSER":   {"min_area": 20, "max_area": 8100, "max_variation": 0.4},
+    "MSER":   {"min_area": 20, "max_area": 8100, "max_variation": 0.25},
 }
 
 # Detectors that return x,y only (no scale or orientation)

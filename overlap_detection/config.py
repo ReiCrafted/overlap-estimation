@@ -162,7 +162,7 @@ class RunConfig:
     """Algorithm-specific constructor overrides forwarded to the OpenCV
     descriptor factory."""
 
-    descriptor_default_sigma: float = 4.0
+    descriptor_default_sigma: float = 6.0
     """Fallback scale (pixels) injected into keypoints whose detector does not
     provide a ``sigma`` value.  Used by scale-dependent descriptors such as
     DAISY, SIFT, LIOP."""
@@ -175,7 +175,7 @@ class RunConfig:
     """Match filtering strategy: ``"mnn"`` (Mutual Nearest Neighbours) or
     ``"mnn_nndr"`` (MNN + Nearest Neighbour Distance Ratio test)."""
 
-    nndr_threshold: float = 0.80
+    nndr_threshold: float = 0.90
     """Lowe-ratio threshold for the NNDR filter.  A match is kept when
     ``d1 / d2 < nndr_threshold``."""
 
@@ -208,10 +208,10 @@ class RunConfig:
     pixel_correspondence_tolerance_px: float = 5.0
     """Per-pixel error budget (B-pixels) for the pixel-correspondence-rate
     metric.  A pixel inside the GT overlap region is counted as correctly
-    placed when ``||M_est @ p − M_gt @ p|| ≤`` this value.  Default 1.0 —
-    sub-pixel alignment.  Lower → stricter; higher → more forgiving."""
+    placed when ``||M_est @ p − M_gt @ p|| ≤`` this value.  Lower → stricter;
+    higher → more forgiving."""
 
-    accuracy_tiers_px: tuple[float, ...] = (3.0, 5.0, 10.0)
+    accuracy_tiers_px: tuple[float, ...] = (3.0, 10.0, 22.0)
     """Mean-corner-error thresholds (px, B-frame) that define the ordinal
     accuracy tiers used to label each attempt's ``*_result`` column.  Error
     is the mean per-vertex distance between the estimated and ground-truth
