@@ -52,3 +52,24 @@ the quality-gate semantics see [project_overview.md](project_overview.md).
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+## Third-party algorithm licenses
+
+This project's code is licensed under MIT. However, some algorithms accessed
+via OpenCV's opencv_contrib package (`xfeatures2d` module) carry their own
+license restrictions, primarily limiting them to non-commercial / academic use:
+
+- SURF (used in U-SURF detector and descriptor) — patented; academic use only.
+  See: https://docs.opencv.org/4.x/df/dd2/tutorial_py_surf_intro.html
+- FREAK (used in SU-FREAK descriptor) — patent status unclear; distributed
+  in opencv_contrib non-free build for this reason.
+- STAR/CenSurE — distributed via opencv_contrib.
+
+Users who intend to use this pipeline commercially should either:
+(a) configure the experiment matrix to exclude the affected detectors and
+    descriptors (U-SURF, SU-FREAK, CenSurE/STAR), or
+(b) obtain appropriate licenses from the respective patent holders.
+
+The remaining detectors (Harris, GFTT, FAST, AGAST, BRISK, SIFT, AKAZE,
+KAZE, MSER) and descriptors (SIFT, RootSIFT, DAISY, BRIEF, BRISK, M-LDB,
+LIOP) are freely usable for any purpose under their respective licenses.
